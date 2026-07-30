@@ -14,7 +14,7 @@
 # bookworm-era font packages (ttf-unifont, ttf-ubuntu-font-family) that trixie
 # renamed (fonts-*), so a cold build on trixie fails at the chromium dep step.
 # Bookworm keeps the cold build reproducible (CI + fresh worktrees).
-FROM python:3.12-slim-bookworm
+FROM python:3.14-slim-bookworm
 
 RUN echo 'path-exclude /usr/share/doc/*' > /etc/dpkg/dpkg.cfg.d/01_nodoc \
     && apt-get update \
