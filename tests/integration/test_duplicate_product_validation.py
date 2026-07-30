@@ -1,0 +1,250 @@
+#!/usr/bin/env python3
+"""
+Unit test for duplicate product validation in media buy packages.
+
+Tests the validation logic that rejects media buy requests where the same
+product_id appears in multiple packages.
+
+📊 BUDGET FORMAT: AdCP v2.2.0 Migration (2025-10-27)
+All tests in this file use float budget format per AdCP v2.2.0 spec:
+- Package.budget: float (e.g., 1000.0) - NOT Budget object
+- Currency is determined by PricingOption, not Package
+"""
+
+import uuid
+from datetime import UTC, datetime, timedelta
+from unittest.mock import MagicMock, patch
+
+import pytest
+
+from src.core.exceptions import AdCPValidationError
+from src.core.resolved_identity import ResolvedIdentity
+from src.core.schemas import CreateMediaBuyRequest
+from src.core.testing_hooks import AdCPTestContext
+from tests.helpers.adcp_factories import create_test_package_request
+
+
+@pytest.mark.requires_db
+class TestDuplicateProductValidation:
+    """Test that duplicate products in packages are rejected."""
+
+    @pytest.mark.asyncio
+    async def test_duplicate_product_in_packages_rejected(self, integration_db):
+        """Test that duplicate product_ids in packages are rejected."""
+        from src.core.tools.media_buy_create import _create_media_buy_impl
+
+        # Mock context manager
+        mock_ctx_manager = MagicMock()
+        mock_persistent_ctx = MagicMock()
+        mock_ctx_manager.get_context.return_value = mock_persistent_ctx
+
+        # Mock tenant for get_current_tenant return
+        mock_tenant = {"tenant_id": "test_tenant", "subdomain": "test", "ad_server": "mock"}
+
+        # Build identity directly instead of patching removed functions
+        identity = ResolvedIdentity(
+            principal_id="test_principal",
+            tenant_id="test_tenant",
+            tenant=mock_tenant,
+            testing_context=AdCPTestContext(dry_run=True, test_session_id="test-session"),
+            protocol="mcp",
+        )
+
+        # Mock the dependencies that still exist on the module
+        with (
+            patch(
+                "src.core.helpers.context_helpers.ensure_tenant_context",
+                return_value=mock_tenant,
+            ),
+            patch(
+                "src.core.auth.get_principal_object",
+                return_value=MagicMock(principal_id="test_principal", name="Test Principal"),
+            ),
+            patch("src.core.tools.media_buy_create.get_context_manager", return_value=mock_ctx_manager),
+        ):
+            # Create packages with duplicate product_id
+            packages = [
+                create_test_package_request(
+                    product_id="prod_test_1",
+                    budget=1000.0,  # Float budget per AdCP v2.2.0, currency from pricing_option
+                    pricing_option_id="test_pricing",
+                ),
+                create_test_package_request(
+                    product_id="prod_test_1",  # Same product as pkg_1
+                    budget=1500.0,  # Float budget per AdCP v2.2.0, currency from pricing_option
+                    pricing_option_id="test_pricing",
+                ),
+            ]
+
+            start_time = datetime.now(UTC) + timedelta(hours=1)  # 1 hour in the future
+            end_time = start_time + timedelta(days=7)
+
+            # Should raise typed AdCPValidationError about duplicate products
+            # (propagates past _impl boundary catch since 572b55b4f).
+            req = CreateMediaBuyRequest(
+                brand={"domain": "testbrand.com"},
+                packages=packages,
+                start_time=start_time,
+                end_time=end_time,
+                idempotency_key=f"int-key-{uuid.uuid4().hex}",
+            )
+            with pytest.raises(AdCPValidationError) as excinfo:
+                await _create_media_buy_impl(req=req, identity=identity)
+
+            exc = excinfo.value
+            assert exc.error_code == "VALIDATION_ERROR"
+            error_msg = exc.message
+            assert "duplicate" in error_msg.lower(), f"Error should mention 'duplicate': {error_msg}"
+            assert "prod_test_1" in error_msg, f"Error should mention 'prod_test_1': {error_msg}"
+            msg = f"Error should say 'each product can only be used once': {error_msg}"
+            assert "each product can only be used once" in error_msg.lower(), msg
+
+    @pytest.mark.asyncio
+    async def test_multiple_duplicate_products_all_listed(self, integration_db):
+        """Test that all duplicate product_ids are listed in error message."""
+        from src.core.tools.media_buy_create import _create_media_buy_impl
+
+        # Mock context manager
+        mock_ctx_manager = MagicMock()
+        mock_persistent_ctx = MagicMock()
+        mock_ctx_manager.get_context.return_value = mock_persistent_ctx
+
+        # Mock tenant for get_current_tenant return
+        mock_tenant = {"tenant_id": "test_tenant", "subdomain": "test", "ad_server": "mock"}
+
+        # Build identity directly instead of patching removed functions
+        identity = ResolvedIdentity(
+            principal_id="test_principal",
+            tenant_id="test_tenant",
+            tenant=mock_tenant,
+            testing_context=AdCPTestContext(dry_run=True, test_session_id="test-session"),
+            protocol="mcp",
+        )
+
+        # Mock the dependencies that still exist on the module
+        with (
+            patch(
+                "src.core.helpers.context_helpers.ensure_tenant_context",
+                return_value=mock_tenant,
+            ),
+            patch(
+                "src.core.auth.get_principal_object",
+                return_value=MagicMock(principal_id="test_principal", name="Test Principal"),
+            ),
+            patch("src.core.tools.media_buy_create.get_context_manager", return_value=mock_ctx_manager),
+        ):
+            # Create packages with multiple duplicates
+            packages = [
+                create_test_package_request(
+                    product_id="prod_test_1",
+                    budget=1000.0,  # Float budget per AdCP v2.2.0, currency from pricing_option
+                    pricing_option_id="test_pricing",
+                ),
+                create_test_package_request(
+                    product_id="prod_test_1",  # Duplicate of pkg_1
+                    budget=1500.0,  # Float budget per AdCP v2.2.0, currency from pricing_option
+                    pricing_option_id="test_pricing",
+                ),
+                create_test_package_request(
+                    product_id="prod_test_2",
+                    budget=2000.0,  # Float budget per AdCP v2.2.0, currency from pricing_option
+                    pricing_option_id="test_pricing",
+                ),
+                create_test_package_request(
+                    product_id="prod_test_2",  # Duplicate of pkg_3
+                    budget=1800.0,  # Float budget per AdCP v2.2.0, currency from pricing_option
+                    pricing_option_id="test_pricing",
+                ),
+            ]
+
+            start_time = datetime.now(UTC) + timedelta(hours=1)  # 1 hour in the future
+            end_time = start_time + timedelta(days=7)
+
+            # Should raise typed AdCPValidationError listing both duplicate products
+            # (propagates past _impl boundary catch since 572b55b4f).
+            req = CreateMediaBuyRequest(
+                brand={"domain": "testbrand.com"},
+                packages=packages,
+                start_time=start_time,
+                end_time=end_time,
+                idempotency_key=f"int-key-{uuid.uuid4().hex}",
+            )
+            with pytest.raises(AdCPValidationError) as excinfo:
+                await _create_media_buy_impl(req=req, identity=identity)
+
+            exc = excinfo.value
+            assert exc.error_code == "VALIDATION_ERROR"
+            error_msg = exc.message
+            assert "prod_test_1" in error_msg
+            assert "prod_test_2" in error_msg
+
+    @pytest.mark.asyncio
+    async def test_no_duplicates_validation_passes(self):
+        """Test that packages with unique product_ids pass validation."""
+        from src.core.tools.media_buy_create import _create_media_buy_impl
+
+        # Mock ALL the dependencies to get past validation
+        with (
+            patch("src.core.database.database_session.get_db_session") as mock_session_context,
+            patch(
+                "src.core.helpers.context_helpers.ensure_tenant_context",
+                return_value={"tenant_id": "test_tenant", "subdomain": "test", "ad_server": "mock"},
+            ),
+            patch("src.core.tools.media_buy_create.activity_feed") as mock_activity,
+        ):
+            # Create a mock session
+            mock_session = MagicMock()
+            mock_session_context.return_value.__enter__ = MagicMock(return_value=mock_session)
+            mock_session_context.return_value.__exit__ = MagicMock(return_value=None)
+
+            # Mock product query to return products
+            mock_product1 = MagicMock()
+            mock_product1.product_id = "prod_test_1"
+            mock_product1.pricing_options = []
+
+            mock_product2 = MagicMock()
+            mock_product2.product_id = "prod_test_2"
+            mock_product2.pricing_options = []
+
+            # Mock scalars().all() to return products
+            mock_scalars = MagicMock()
+            mock_scalars.all.return_value = [mock_product1, mock_product2]
+            mock_session.scalars.return_value = mock_scalars
+
+            # Mock currency limit query
+            mock_session.scalar.return_value = None  # No currency limit found
+
+            # Create packages with different product_ids
+            packages = [
+                create_test_package_request(
+                    product_id="prod_test_1",
+                    budget=1000.0,  # Float budget per AdCP v2.2.0, currency from pricing_option
+                    pricing_option_id="test_pricing",
+                ),
+                create_test_package_request(
+                    product_id="prod_test_2",  # Different product
+                    budget=1500.0,  # Float budget per AdCP v2.2.0, currency from pricing_option
+                    pricing_option_id="test_pricing",
+                ),
+            ]
+
+            start_time = datetime.now(UTC) + timedelta(hours=1)  # 1 hour in the future
+            end_time = start_time + timedelta(days=7)
+
+            # Should fail on currency validation (since we didn't set that up)
+            # but NOT on duplicate product validation
+            req = CreateMediaBuyRequest(
+                brand={"domain": "testbrand.com"},
+                packages=packages,
+                start_time=start_time,
+                end_time=end_time,
+                idempotency_key=f"int-key-{uuid.uuid4().hex}",
+            )
+            with pytest.raises((ValueError, Exception)) as exc_info:
+                await _create_media_buy_impl(req=req)
+
+            # Should NOT be about duplicate products
+            error_msg = str(exc_info.value)
+            # If it's about duplicates, the test failed
+            if "duplicate" in error_msg.lower() and "product" in error_msg.lower():
+                pytest.fail(f"Validation should not fail on duplicate products, but got: {error_msg}")

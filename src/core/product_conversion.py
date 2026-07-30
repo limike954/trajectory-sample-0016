@@ -1,0 +1,580 @@
+"""Product conversion utilities.
+
+This module provides functions to convert between database Product models
+and AdCP Product schema objects, including proper handling of pricing options,
+publisher properties, and all required fields.
+
+V3 Migration Notes:
+- Pricing types consolidated: CpmAuctionPricingOption/CpmFixedRatePricingOption → CpmPricingOption
+- is_fixed removed: Use fixed_price presence to indicate fixed pricing
+- rate → fixed_price for fixed pricing
+- price_guidance.floor → floor_price (top-level)
+"""
+
+import logging
+
+from adcp import (
+    CpaPricingOption,
+    CpcPricingOption,
+    CpcvPricingOption,
+    CpmPricingOption,
+    CppPricingOption,
+    CpvPricingOption,
+    EventType,
+    FlatRatePricingOption,
+    TimeBasedPricingOption,
+    TimeUnit,
+    VcpmPricingOption,
+)
+from adcp.types._generated import MediaChannel
+from adcp.types.generated_poc.pricing_options.time_option import Parameters as TimeParameters
+from packaging.version import InvalidVersion, Version
+
+# Import our extended Product (includes implementation_config)
+# Not the library Product - we need the internal fields
+from src.core.schemas import Product
+
+logger = logging.getLogger(__name__)
+
+V3_VERSION = Version("3.0.0")
+
+
+def needs_v2_compat(adcp_version: str | None) -> bool:
+    """Check if a client needs v2 backward-compat fields in responses.
+
+    V2 compat fields (is_fixed, rate, price_guidance.floor) are only needed
+    for pre-3.0 clients. V3+ clients get clean responses per AdCP v3 spec.
+
+    Args:
+        adcp_version: Client-declared AdCP version string, or None if unknown.
+
+    Returns:
+        True if v2 compat fields should be added (version is None, < 3.0, or unparseable).
+    """
+    if adcp_version is None:
+        return True
+    try:
+        return Version(adcp_version) < V3_VERSION
+    except InvalidVersion:
+        logger.warning(f"Unparseable adcp_version '{adcp_version}', defaulting to v2 compat")
+        return True
+
+
+def convert_pricing_option_to_adcp(
+    pricing_option,
+) -> (
+    CpmPricingOption
+    | VcpmPricingOption
+    | CpcPricingOption
+    | CpcvPricingOption
+    | CpvPricingOption
+    | CppPricingOption
+    | FlatRatePricingOption
+    | CpaPricingOption
+    | TimeBasedPricingOption
+):
+    """Convert database PricingOption to AdCP V3 pricing option.
+
+    V3 Changes:
+    - Pricing types consolidated (CpmPricingOption instead of Cpm{Auction,Fixed}PricingOption)
+    - is_fixed removed: fixed_price presence indicates fixed pricing
+    - rate → fixed_price
+    - price_guidance.floor → floor_price
+
+    Args:
+        pricing_option: Database PricingOption model
+
+    Returns:
+        Typed AdCP pricing option instance (CpmPricingOption, etc.)
+
+    Raises:
+        ValueError: If pricing_model is not supported
+    """
+
+    # Support both ORM objects and dicts
+    def get_attr(obj, key):
+        """Get attribute from either dict or object."""
+        if isinstance(obj, dict):
+            return obj.get(key)
+        return getattr(obj, key, None)
+
+    pricing_model = get_attr(pricing_option, "pricing_model").lower()
+    is_fixed = get_attr(pricing_option, "is_fixed")  # Internal flag, not sent to API
+    currency = get_attr(pricing_option, "currency")
+
+    pricing_option_id = f"{pricing_model}_{currency.lower()}_{'fixed' if is_fixed else 'auction'}"
+
+    # Build common fields shared across all pricing options (V3 format)
+    # Note: is_fixed and rate are added during serialization for v2.x compat
+    common_fields = {
+        "pricing_model": pricing_model,
+        "currency": currency,
+        "pricing_option_id": pricing_option_id,
+    }
+
+    # Add min_spend_per_package if present
+    min_spend = get_attr(pricing_option, "min_spend_per_package")
+    if min_spend:
+        common_fields["min_spend_per_package"] = float(min_spend)
+
+    rate = get_attr(pricing_option, "rate")
+    price_guidance = get_attr(pricing_option, "price_guidance")
+    parameters = get_attr(pricing_option, "parameters")
+
+    # Extract floor from price_guidance if present (V3: moves to top-level floor_price)
+    floor_price = None
+    if price_guidance:
+        if isinstance(price_guidance, dict):
+            floor_price = price_guidance.get("floor")
+        elif hasattr(price_guidance, "floor"):
+            floor_price = price_guidance.floor
+
+    # Discriminate by pricing_model to return typed instances
+    if pricing_model == "cpm":
+        if is_fixed:
+            if not rate:
+                raise ValueError(f"Fixed CPM pricing option {pricing_option_id} requires rate")
+            return CpmPricingOption(
+                **common_fields,
+                fixed_price=float(rate),
+            )
+        else:
+            if not price_guidance:
+                raise ValueError(f"Auction CPM pricing option {pricing_option_id} requires price_guidance")
+            # V3: floor moves to top-level, price_guidance only has percentiles
+            result = CpmPricingOption(
+                **common_fields,
+                price_guidance=price_guidance,
+            )
+            if floor_price is not None:
+                result = CpmPricingOption(
+                    **common_fields,
+                    floor_price=float(floor_price),
+                    price_guidance=price_guidance,
+                )
+            return result
+
+    elif pricing_model == "vcpm":
+        if is_fixed:
+            if not rate:
+                raise ValueError(f"Fixed VCPM pricing option {pricing_option_id} requires rate")
+            return VcpmPricingOption(
+                **common_fields,
+                fixed_price=float(rate),
+            )
+        else:
+            if not price_guidance:
+                raise ValueError(f"Auction VCPM pricing option {pricing_option_id} requires price_guidance")
+            vcpm_result = VcpmPricingOption(
+                **common_fields,
+                price_guidance=price_guidance,
+            )
+            if floor_price is not None:
+                vcpm_result = VcpmPricingOption(
+                    **common_fields,
+                    floor_price=float(floor_price),
+                    price_guidance=price_guidance,
+                )
+            return vcpm_result
+
+    elif pricing_model == "cpc":
+        if is_fixed:
+            if not rate:
+                raise ValueError(f"Fixed CPC pricing option {pricing_option_id} requires rate")
+            return CpcPricingOption(
+                **common_fields,
+                fixed_price=float(rate),
+            )
+        else:
+            if not price_guidance:
+                raise ValueError(f"Auction CPC pricing option {pricing_option_id} requires price_guidance")
+            cpc_result = CpcPricingOption(
+                **common_fields,
+                price_guidance=price_guidance,
+            )
+            if floor_price is not None:
+                cpc_result = CpcPricingOption(
+                    **common_fields,
+                    floor_price=float(floor_price),
+                    price_guidance=price_guidance,
+                )
+            return cpc_result
+
+    elif pricing_model == "cpcv":
+        # CPCV (Cost Per Completed View) - typically fixed rate
+        if not rate:
+            raise ValueError(f"CPCV pricing option {pricing_option_id} requires rate")
+        result_fields = {
+            **common_fields,
+            "fixed_price": float(rate),
+        }
+        # CPCV may have optional parameters for view completion threshold
+        if parameters:
+            result_fields["parameters"] = parameters
+        return CpcvPricingOption(**result_fields)
+
+    elif pricing_model == "cpv":
+        # CPV (Cost Per View) - typically auction-based
+        if not rate:
+            raise ValueError(f"CPV pricing option {pricing_option_id} requires rate")
+        result_fields = {**common_fields}
+        if is_fixed:
+            result_fields["fixed_price"] = float(rate)
+        else:
+            result_fields["floor_price"] = float(rate)
+        # CPV may have optional parameters for view threshold
+        if parameters:
+            result_fields["parameters"] = parameters
+        return CpvPricingOption(**result_fields)
+
+    elif pricing_model == "cpp":
+        # CPP (Cost Per Point) - requires demographic parameters
+        if not rate:
+            raise ValueError(f"CPP pricing option {pricing_option_id} requires rate")
+        if not parameters:
+            raise ValueError(f"CPP pricing option {pricing_option_id} requires parameters (demographic)")
+        return CppPricingOption(
+            **common_fields,
+            fixed_price=float(rate),
+            parameters=parameters,
+        )
+
+    elif pricing_model == "flat_rate":
+        # Flat rate pricing - fixed cost regardless of delivery
+        if not rate:
+            raise ValueError(f"Flat rate pricing option {pricing_option_id} requires rate")
+        result_fields = {
+            **common_fields,
+            "fixed_price": float(rate),
+        }
+        # Flat rate may have optional parameters (DOOH venue packages, SOV, etc.)
+        # adcp 3.10: Parameters requires type="dooh" discriminator
+        if parameters:
+            if isinstance(parameters, dict) and "type" not in parameters:
+                parameters = {**parameters, "type": "dooh"}
+            result_fields["parameters"] = parameters
+        return FlatRatePricingOption(**result_fields)
+
+    elif pricing_model == "cpa":
+        # CPA (Cost Per Acquisition) - AdCP v3.1 pricing model for affiliate/conversion pricing.
+        # CPA always emits fixed_price; use a stable _fixed suffix regardless of is_fixed flag.
+        # event_type is required per cpa-option.json; no default — an unknown value is a mispricing.
+        cpa_pricing_option_id = f"cpa_{currency.lower()}_fixed"
+        if not rate:
+            raise ValueError(f"CPA pricing option {cpa_pricing_option_id} requires rate")
+        raw_event = parameters.get("event_type") if isinstance(parameters, dict) else None
+        if not raw_event:
+            raise ValueError(f"CPA pricing option {cpa_pricing_option_id} requires parameters.event_type")
+        try:
+            event_type_val = EventType(raw_event)
+        except ValueError:
+            raise ValueError(
+                f"CPA pricing option {cpa_pricing_option_id} has unknown event_type '{raw_event}'. "
+                f"Supported values: {[e.value for e in EventType]}"
+            )
+        if event_type_val == EventType.custom:
+            custom_event_name = parameters.get("custom_event_name") if isinstance(parameters, dict) else None
+            if not custom_event_name:
+                raise ValueError(
+                    f"CPA pricing option {cpa_pricing_option_id} with event_type 'custom' requires parameters.custom_event_name"
+                )
+        else:
+            custom_event_name = None
+        event_source_id = parameters.get("event_source_id") if isinstance(parameters, dict) else None
+        cpa_fields = {**common_fields, "pricing_option_id": cpa_pricing_option_id}
+        return CpaPricingOption(
+            **cpa_fields,
+            event_type=event_type_val,
+            custom_event_name=custom_event_name,
+            event_source_id=event_source_id,
+            fixed_price=float(rate),
+        )
+
+    elif pricing_model == "time":
+        # Time-Based pricing - AdCP v3.1 model where rate scales with campaign duration.
+        # fixed_price is the cost per time_unit; parameters.time_unit is required.
+        # Supports both fixed (fixed_price) and auction (floor_price) variants.
+        if not parameters or not isinstance(parameters, dict) or "time_unit" not in parameters:
+            raise ValueError(
+                f"Time-based pricing option {pricing_option_id} requires parameters.time_unit "
+                f"(one of: hour, day, week, month)"
+            )
+        raw_time_unit = parameters["time_unit"]
+        try:
+            time_unit_val = TimeUnit(raw_time_unit)
+        except ValueError:
+            raise ValueError(
+                f"Time-based pricing option {pricing_option_id} has unknown time_unit '{raw_time_unit}'. "
+                f"Supported values: {[u.value for u in TimeUnit]}"
+            )
+        time_params = TimeParameters(
+            time_unit=time_unit_val,
+            min_duration=parameters.get("min_duration"),
+            max_duration=parameters.get("max_duration"),
+        )
+        if (
+            time_params.min_duration is not None
+            and time_params.max_duration is not None
+            and time_params.max_duration < time_params.min_duration
+        ):
+            raise ValueError(
+                f"Time-based pricing option {pricing_option_id} has max_duration "
+                f"({time_params.max_duration}) < min_duration ({time_params.min_duration})"
+            )
+        time_fields: dict = {**common_fields, "parameters": time_params}
+        if is_fixed:
+            if rate is None:
+                raise ValueError(f"Fixed time-based pricing option {pricing_option_id} requires rate")
+            time_fields["fixed_price"] = float(rate)
+        else:
+            if floor_price is not None:
+                time_fields["floor_price"] = float(floor_price)
+            if price_guidance:
+                time_fields["price_guidance"] = price_guidance
+        return TimeBasedPricingOption(**time_fields)
+
+    else:
+        raise ValueError(
+            f"Unsupported pricing_model '{pricing_model}'. "
+            f"Supported models: cpm, vcpm, cpc, cpcv, cpv, cpp, flat_rate, cpa, time"
+        )
+
+
+def convert_product_model_to_schema(product_model, adapter_type: str | None = None) -> Product:
+    """Convert database Product model to Product schema.
+
+    Args:
+        product_model: Product database model
+        adapter_type: Adapter type for the tenant (e.g., "google_ad_manager", "mock").
+            Used to determine the default delivery_measurement when the product
+            does not have one configured. If None, falls back to generic "publisher".
+
+    Returns:
+        Product schema object
+
+    Raises:
+        ValueError: In non-production environments, if delivery_measurement is missing
+            and no adapter_type is provided to determine the default.
+    """
+    # Map fields from model to schema
+    product_data = {}
+
+    # Required fields per AdCP spec
+    product_data["product_id"] = product_model.product_id
+    product_data["name"] = product_model.name
+    product_data["description"] = product_model.description
+    product_data["delivery_type"] = product_model.delivery_type
+
+    # format_ids: Use effective_format_ids which auto-resolves from profile if set
+    # Products must have at least one format_id to be valid for media buys
+    effective_formats = product_model.effective_format_ids or []
+    if not effective_formats:
+        raise ValueError(
+            f"Product {product_model.product_id} has no format_ids configured. "
+            f"Products must specify supported creative formats to be available for purchase. "
+            f"Configure format_ids on the product or its inventory profile."
+        )
+    product_data["format_ids"] = effective_formats
+
+    # publisher_properties: Use effective_properties which returns AdCP 2.0.0 discriminated union format
+    effective_props = product_model.effective_properties
+    if not effective_props:
+        raise ValueError(
+            f"Product {product_model.product_id} has no publisher_properties. "
+            "All products must have at least one property per AdCP spec."
+        )
+    product_data["publisher_properties"] = effective_props
+
+    # delivery_measurement: REQUIRED per AdCP spec.
+    # Use the product's configured value, or fall back to adapter-specific default.
+    if product_model.delivery_measurement:
+        product_data["delivery_measurement"] = product_model.delivery_measurement
+    else:
+        from src.adapters import get_adapter_default_delivery_measurement
+        from src.core.config import is_production
+
+        default_dm = get_adapter_default_delivery_measurement(adapter_type or "")
+        if is_production():
+            logger.info(
+                "Product %s missing delivery_measurement, using adapter default: %s",
+                product_model.product_id,
+                default_dm["provider"],
+            )
+        else:
+            logger.warning(
+                "Product %s missing delivery_measurement (REQUIRED per AdCP spec). "
+                "Using adapter default '%s'. Configure delivery_measurement on the product to silence this warning.",
+                product_model.product_id,
+                default_dm["provider"],
+            )
+        product_data["delivery_measurement"] = default_dm
+
+    # pricing_options: Convert database PricingOption models to AdCP V3 format
+    # Per adcp library spec, pricing_options must have at least 1 item (min_length=1)
+    if product_model.pricing_options:
+        product_data["pricing_options"] = [convert_pricing_option_to_adcp(po) for po in product_model.pricing_options]
+    else:
+        # Products without pricing options cannot be converted to AdCP schema
+        # This is a data integrity error - all products must have pricing
+        raise ValueError(
+            f"Product {product_model.product_id} has no pricing_options. "
+            f"All products must have at least one pricing option per AdCP spec. "
+            f"Create a PricingOption record for this product."
+        )
+
+    # Optional fields
+    if product_model.measurement:
+        product_data["measurement"] = product_model.measurement
+    if product_model.creative_policy:
+        product_data["creative_policy"] = product_model.creative_policy
+    # Note: price_guidance is database metadata, not in AdCP Product schema - omit it
+    # Pricing information should be in pricing_options per AdCP spec
+
+    # Filter-related internal fields
+    if hasattr(product_model, "countries") and product_model.countries:
+        product_data["countries"] = product_model.countries
+    # channels: DB stores strings, schema uses MediaChannel enum
+    if hasattr(product_model, "channels") and product_model.channels:
+        converted_channels = []
+        for ch in product_model.channels:
+            try:
+                converted_channels.append(MediaChannel(ch))
+            except ValueError:
+                logger.warning("Unknown channel value '%s' in product %s, skipping", ch, product_model.product_id)
+        if converted_channels:
+            product_data["channels"] = converted_channels
+
+    if product_model.product_card:
+        product_data["product_card"] = product_model.product_card
+    if product_model.product_card_detailed:
+        product_data["product_card_detailed"] = product_model.product_card_detailed
+    if product_model.placements:
+        product_data["placements"] = product_model.placements
+    if product_model.reporting_capabilities:
+        product_data["reporting_capabilities"] = product_model.reporting_capabilities
+    else:
+        # adcp 4.3 makes reporting_capabilities required — provide minimal default
+        product_data["reporting_capabilities"] = {
+            "available_reporting_frequencies": ["daily"],
+            "expected_delay_minutes": 1440,
+            "timezone": "UTC",
+            "supports_webhooks": False,
+            "available_metrics": ["impressions"],
+            "date_range_support": "date_range",
+        }
+
+    # Default is_custom to False if not set
+    product_data["is_custom"] = product_model.is_custom if product_model.is_custom else False
+
+    # AdCP 3.6.0 fields — direct attribute access on typed Mapped[] columns
+    if product_model.property_targeting_allowed is not None:
+        product_data["property_targeting_allowed"] = product_model.property_targeting_allowed
+    if product_model.signal_targeting_allowed is not None:
+        product_data["signal_targeting_allowed"] = product_model.signal_targeting_allowed
+    if product_model.catalog_match is not None:
+        product_data["catalog_match"] = product_model.catalog_match
+    if product_model.catalog_types is not None:
+        product_data["catalog_types"] = product_model.catalog_types
+    if product_model.conversion_tracking is not None:
+        product_data["conversion_tracking"] = product_model.conversion_tracking
+    if product_model.data_provider_signals is not None:
+        product_data["data_provider_signals"] = product_model.data_provider_signals
+    if product_model.forecast is not None:
+        product_data["forecast"] = product_model.forecast
+
+    # Internal fields (not in AdCP spec, but in our extended Product schema)
+    # Use effective_implementation_config to auto-resolve from inventory profile if set
+    if hasattr(product_model, "effective_implementation_config"):
+        product_data["implementation_config"] = product_model.effective_implementation_config
+    elif hasattr(product_model, "implementation_config"):
+        product_data["implementation_config"] = product_model.implementation_config
+    else:
+        product_data["implementation_config"] = None
+
+    # Principal access control (internal field)
+    product_data["allowed_principal_ids"] = getattr(product_model, "allowed_principal_ids", None)
+
+    # Device type targeting (from targeting_template.device_targets)
+    targeting_template = getattr(product_model, "targeting_template", None)
+    if targeting_template and isinstance(targeting_template, dict):
+        device_targets = targeting_template.get("device_targets")
+        if isinstance(device_targets, list):
+            product_data["device_types"] = device_targets
+
+    return Product(**product_data)
+
+
+def dump_pricing_option_v2_compat(po_model) -> dict:
+    """Serialize a pricing option model with v2.x backward-compat fields.
+
+    Takes a pricing option model object (CpmPricingOption, VcpmPricingOption, etc.)
+    and returns a serialized dict that includes v2.x fields:
+    - is_fixed: True if fixed_price is present, False otherwise
+    - rate: Copy of fixed_price when present (v2.x field name)
+    - price_guidance.floor: Copy of floor_price when present
+
+    Handles both RootModel-wrapped and unwrapped pricing option types.
+
+    Args:
+        po_model: A pricing option model (library type or RootModel wrapper).
+
+    Returns:
+        Serialized pricing option dict with v2.x backward-compat fields added.
+    """
+    # Unwrap RootModel if needed (adcp library wraps in PricingOption RootModel)
+    inner = getattr(po_model, "root", po_model)
+
+    # Serialize the model to dict
+    po_dict = inner.model_dump(mode="json", exclude_none=True)
+
+    # Read fields from the model, not the dict, to derive v2 compat values
+    fixed_price = getattr(inner, "fixed_price", None)
+    floor_price = getattr(inner, "floor_price", None)
+
+    # Add is_fixed discriminator (v2.x expected this field)
+    po_dict["is_fixed"] = fixed_price is not None
+
+    # Add rate field (v2.x name for fixed_price)
+    if fixed_price is not None:
+        po_dict["rate"] = fixed_price
+
+    # If floor_price is set, add floor to price_guidance for v2.x compat
+    if floor_price is not None:
+        if "price_guidance" not in po_dict:
+            po_dict["price_guidance"] = {}
+        po_dict["price_guidance"]["floor"] = floor_price
+
+    return po_dict
+
+
+def dump_product_v2_compat(product) -> dict:
+    """Serialize a Product model with v2.x backward-compat pricing options.
+
+    Takes a Product model and returns a serialized dict where pricing_options
+    include v2.x backward-compat fields (is_fixed, rate, price_guidance.floor).
+
+    Args:
+        product: A Product model (schema object with pricing_options).
+
+    Returns:
+        Serialized product dict with v2.x backward-compat pricing options.
+    """
+    product_dict = product.model_dump(mode="json")
+
+    # Replace pricing_options with v2-compat serialization from models
+    if hasattr(product, "pricing_options") and product.pricing_options:
+        product_dict["pricing_options"] = [dump_pricing_option_v2_compat(po) for po in product.pricing_options]
+
+    return product_dict
+
+
+def dump_products_v2_compat(products: list) -> list[dict]:
+    """Serialize a list of Product models with v2.x backward-compat pricing.
+
+    Args:
+        products: List of Product model objects.
+
+    Returns:
+        List of serialized product dicts with v2.x backward-compat fields.
+    """
+    return [dump_product_v2_compat(p) for p in products]

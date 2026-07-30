@@ -1,0 +1,353 @@
+"""Signals Agent Registry for upstream signals discovery integration.
+
+This module provides:
+1. Signals agent registry (tenant-specific agents)
+2. Dynamic signals discovery via AdCP library
+3. Multi-agent support for different signals providers
+
+Architecture:
+- No default agent (tenant-specific only)
+- Tenant agents: Configured in signals_agents database table
+- Signals resolution: Query agents via adcp library, handle responses
+
+Schema Version: AdCP v2.2.0
+- Uses signal_spec (not brief from v1)
+- Uses deliver_to.platforms as array of strings ["all"] (not single string "all")
+- Supports custom auth headers via auth_header parameter
+
+Security:
+- Auth credentials stored in database (tenant-specific)
+- Custom auth headers supported (e.g., Authorization, x-api-key)
+- Bearer token format: "Bearer {token}"
+- Token format: "{token}"
+
+Migration Note: Now uses official `adcp` library (v1.0.1) instead of custom MCP client.
+- ~100 lines of custom code replaced with official library
+- Custom auth headers now fully supported (was critical blocker)
+- Maintains backward compatibility with existing API
+"""
+
+import logging
+from dataclasses import dataclass
+from typing import Any
+
+from adcp import ADCPMultiAgentClient
+from adcp.exceptions import ADCPAuthenticationError, ADCPConnectionError, ADCPError
+
+from src.core.exceptions import AdCPAdapterError
+from src.core.schemas import GetSignalsRequest
+
+logger = logging.getLogger(__name__)
+
+
+@dataclass
+class SignalsAgent:
+    """Represents a signals discovery agent that provides product enhancement via signals.
+
+    Note: priority, max_signal_products, and fallback_to_database are configured per-product,
+    not per-agent.
+    """
+
+    agent_url: str
+    name: str
+    enabled: bool = True
+    auth: dict[str, Any] | None = None  # Optional auth config for private agents
+    auth_header: str | None = None  # HTTP header name for auth (e.g., "Authorization", "x-api-key")
+    forward_promoted_offering: bool = True
+    timeout: int = 30
+
+
+class SignalsAgentRegistry:
+    """Registry of signals discovery agents with dynamic discovery.
+
+    Usage:
+        registry = SignalsAgentRegistry()
+
+        # Get signals from all agents
+        signals = await registry.get_signals(
+            brief="automotive targeting",
+            tenant_id="tenant_123",
+            promoted_offering="Tesla Model 3"
+        )
+    """
+
+    def __init__(self):
+        """Initialize registry."""
+        pass  # No cache needed - adcp library handles connection pooling
+
+    def _get_tenant_agents(self, tenant_id: str) -> list[SignalsAgent]:
+        """Get list of signals agents for a tenant.
+
+        Returns:
+            List of SignalsAgent instances (tenant-specific only)
+        """
+        agents = []
+
+        # Load tenant-specific agents from database
+        from sqlalchemy import select
+
+        from src.core.database.database_session import get_db_session
+        from src.core.database.models import SignalsAgent as SignalsAgentModel
+
+        with get_db_session() as session:
+            stmt = select(SignalsAgentModel).filter_by(tenant_id=tenant_id, enabled=True)
+            db_agents = session.scalars(stmt).all()
+
+            for db_agent in db_agents:
+                # Parse auth credentials if present
+                auth = None
+                if db_agent.auth_type and db_agent.auth_credentials:
+                    auth = {
+                        "type": db_agent.auth_type,
+                        "credentials": db_agent.auth_credentials,
+                    }
+
+                agents.append(
+                    SignalsAgent(
+                        agent_url=db_agent.agent_url,
+                        name=db_agent.name,
+                        enabled=db_agent.enabled,
+                        auth=auth,
+                        auth_header=db_agent.auth_header,
+                        forward_promoted_offering=db_agent.forward_promoted_offering,
+                        timeout=db_agent.timeout,
+                    )
+                )
+
+        # Sort by name for consistent ordering
+        agents.sort(key=lambda a: a.name)
+        return [a for a in agents if a.enabled]
+
+    def _build_adcp_client(self, agents: list[SignalsAgent]) -> ADCPMultiAgentClient:
+        """Build AdCP client from signals agent configs."""
+        from src.core.helpers.adapter_helpers import build_agent_config
+
+        return ADCPMultiAgentClient(agents=[build_agent_config(agent) for agent in agents])
+
+    async def _get_signals_from_agent(
+        self,
+        client: ADCPMultiAgentClient,
+        agent: SignalsAgent,
+        brief: str,
+        tenant_id: str,
+        principal_id: str | None = None,
+        context: dict[str, Any] | None = None,
+        principal_data: dict[str, Any] | None = None,
+    ) -> list[dict[str, Any]]:
+        """Fetch signals from a signals discovery agent via adcp library.
+
+        Args:
+            client: AdCP client instance
+            agent: SignalsAgent to query
+            brief: Search brief/query
+            tenant_id: Tenant identifier
+            principal_id: Optional principal identifier
+            context: Optional context data
+            principal_data: Optional principal information
+
+        Returns:
+            List of signal objects from the agent
+        """
+        import time
+
+        start_time = time.time()
+
+        try:
+            # Build request parameters using new AdCP v2.2.0 schema
+            # Map our old 'brief' parameter to 'signal_spec'
+            signal_spec = brief
+
+            # Create typed request (adcp 3.12: countries/destinations are flat on request, not via DeliverTo)
+            request = GetSignalsRequest(
+                signal_spec=signal_spec,
+            )
+
+            logger.info(f"[TIMING] Calling agent {agent.name} for tenant {tenant_id}, brief: {brief[:50]}...")
+            call_start = time.time()
+
+            # Call agent
+            result = await client.agent(agent.name).get_signals(request)
+
+            call_duration = time.time() - call_start
+            logger.info(f"[TIMING] Agent call completed in {call_duration:.2f}s, status: {result.status}")
+
+            # Handle response based on status
+            if result.status == "completed":
+                # Synchronous completion
+                if result.data is None:
+                    raise AdCPAdapterError(
+                        "Completed status but no data in signals response",
+                        recovery="terminal",
+                    )
+                signals = result.data.signals
+                total_duration = time.time() - start_time
+                logger.info(f"[TIMING] Got {len(signals or [])} signals synchronously in {total_duration:.2f}s total")
+                # Convert Signal objects to dicts for internal use
+                # AdCP library returns Signal objects, but our internal code expects dicts
+                # Handle both Signal objects (from adcp library) and dicts (from some test/error scenarios)
+                result_signals = []
+                for signal in signals or []:
+                    if isinstance(signal, dict):
+                        # Already a dict, use as-is
+                        result_signals.append(signal)
+                    else:
+                        # Pydantic Signal object, convert to dict
+                        result_signals.append(signal.model_dump(mode="json"))
+                return result_signals
+
+            elif result.status == "submitted":
+                # Asynchronous completion - webhook registered
+                total_duration = time.time() - start_time
+                if result.submitted is None:
+                    raise AdCPAdapterError(
+                        "Submitted status but no submitted info in signals response",
+                        recovery="terminal",
+                    )
+                logger.info(
+                    f"[TIMING] Async operation submitted in {total_duration:.2f}s, "
+                    f"webhook: {result.submitted.webhook_url}"
+                )
+                # For now, return empty list (webhook will deliver results later)
+                return []
+
+            else:
+                raise AdCPAdapterError(
+                    f"Unexpected result status from {agent.name}: {result.status}",
+                    recovery="terminal",
+                )
+
+        except ADCPError as e:
+            from src.core.helpers.adapter_helpers import raise_mapped_adcp_error
+
+            raise_mapped_adcp_error(e, agent_label=agent.name, logger=logger)
+
+    async def get_signals(
+        self,
+        brief: str,
+        tenant_id: str,
+        principal_id: str | None = None,
+        context: dict[str, Any] | None = None,
+        principal_data: dict[str, Any] | None = None,
+    ) -> list[dict[str, Any]]:
+        """Get signals from all registered agents for a tenant.
+
+        Args:
+            brief: Search brief/query
+            tenant_id: Tenant identifier
+            principal_id: Optional principal identifier
+            context: Optional context data (may include promoted_offering)
+            principal_data: Optional principal information
+
+        Returns:
+            List of all signal objects across all agents
+        """
+        agents = self._get_tenant_agents(tenant_id)
+        all_signals: list[dict[str, Any]] = []
+
+        logger.info(f"get_signals: Found {len(agents)} agents for tenant {tenant_id}")
+
+        if not agents:
+            return all_signals
+
+        # Build AdCP client for all agents and use as async context manager
+        client = self._build_adcp_client(agents)
+
+        # Use async context manager to ensure proper cleanup
+        async with client:
+            # Query each agent
+            for agent in agents:
+                logger.info(f"get_signals: Fetching from {agent.agent_url}")
+                try:
+                    signals = await self._get_signals_from_agent(
+                        client,
+                        agent,
+                        brief=brief,
+                        tenant_id=tenant_id,
+                        principal_id=principal_id,
+                        context=context,
+                        principal_data=principal_data,
+                    )
+                    logger.info(f"get_signals: Got {len(signals)} signals from {agent.agent_url}")
+                    all_signals.extend(signals)
+                except Exception as e:
+                    # Log error but continue with other agents (graceful degradation)
+                    logger.error(f"Failed to fetch signals from {agent.agent_url}: {e}", exc_info=True)
+                    continue
+
+        logger.info(f"get_signals: Returning {len(all_signals)} total signals")
+        return all_signals
+
+    async def test_connection(
+        self, agent_url: str, auth: dict[str, Any] | None = None, auth_header: str | None = None
+    ) -> dict[str, Any]:
+        """Test connection to a signals agent.
+
+        Args:
+            agent_url: URL of the signals agent
+            auth: Optional authentication configuration
+            auth_header: Optional custom auth header name
+
+        Returns:
+            dict with success status and message/error
+        """
+        try:
+            # Create test agent config
+            test_agent = SignalsAgent(
+                agent_url=agent_url,
+                name="Test Agent",
+                enabled=True,
+                auth=auth,
+                auth_header=auth_header,
+                timeout=30,
+            )
+
+            # Build AdCP client and use as async context manager
+            client = self._build_adcp_client([test_agent])
+
+            async with client:
+                # Try to fetch signals with minimal query
+                signals = await self._get_signals_from_agent(
+                    client,
+                    test_agent,
+                    brief="test",
+                    tenant_id="test_tenant",
+                )
+
+                return {
+                    "success": True,
+                    "message": "Successfully connected to signals agent",
+                    "signal_count": len(signals),
+                }
+
+        except ADCPAuthenticationError as e:
+            logger.error(f"Connection test failed (auth): {e.message}")
+            return {
+                "success": False,
+                "error": f"Authentication failed: {e.message}. Check credentials and auth header.",
+            }
+
+        except ADCPConnectionError as e:
+            logger.error(f"Connection test failed (connection): {e.message}")
+            return {
+                "success": False,
+                "error": f"Connection failed: {e.message}. Check agent URL and network.",
+            }
+
+        except Exception as e:
+            logger.error(f"Connection test failed: {e}", exc_info=True)
+            return {
+                "success": False,
+                "error": f"Connection failed: {str(e)}",
+            }
+
+
+# Global registry instance
+_registry: SignalsAgentRegistry | None = None
+
+
+def get_signals_agent_registry() -> SignalsAgentRegistry:
+    """Get the global signals agent registry instance."""
+    global _registry
+    if _registry is None:
+        _registry = SignalsAgentRegistry()
+    return _registry

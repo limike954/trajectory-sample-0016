@@ -1,0 +1,446 @@
+"""Sync creatives orchestrator: main _sync_creatives_impl function."""
+
+import logging
+import time
+from collections.abc import Sequence
+from typing import Any
+
+from adcp import PushNotificationConfig
+from adcp.types import ContextObject, CreativeAction, CreativeAsset
+from pydantic import BaseModel
+
+from src.core.auth import require_identity, require_principal_id, require_tenant
+from src.core.database.repositories.uow import CreativeUoW
+from src.core.helpers import log_tool_activity
+from src.core.resolved_identity import ResolvedIdentity
+from src.core.schemas import SyncCreativeResult, SyncCreativesResponse
+from src.core.validation_helpers import format_validation_error, run_async_in_sync_context
+
+from ._assignments import _process_assignments
+from ._processing import _create_new_creative, _failed_sync_result, _update_existing_creative
+from ._validation import _get_field, _validate_creative_input, check_provenance_required
+from ._workflow import _audit_log_sync, _create_sync_workflow_steps, _send_creative_notifications
+
+logger = logging.getLogger(__name__)
+
+
+def _sync_creatives_impl(
+    creatives: Sequence[CreativeAsset | BaseModel | dict[str, Any]],
+    assignments: dict | None = None,
+    creative_ids: list[str] | None = None,
+    delete_missing: bool = False,
+    dry_run: bool = False,
+    validation_mode: str = "strict",
+    push_notification_config: PushNotificationConfig | dict | None = None,
+    context: ContextObject | dict | None = None,
+    identity: ResolvedIdentity | None = None,
+) -> SyncCreativesResponse:
+    """Sync creative assets to centralized library (AdCP v2.5 spec compliant endpoint).
+
+    Primary creative management endpoint that handles:
+    - Bulk creative upload/update with upsert semantics
+    - Creative assignment to media buy packages via assignments dict
+    - Support for both hosted assets (media_url) and third-party tags (snippet)
+    - Scoped updates via creative_ids filter, dry-run mode, and validation options
+
+    Args:
+        creatives: Array of creative assets to sync
+        assignments: Bulk assignment map of creative_id to package_ids (spec-compliant)
+        creative_ids: Filter to limit sync scope to specific creatives (AdCP 2.5).
+            - None (default): Process all creatives in payload
+            - Empty list []: Process no creatives (filter matches nothing)
+            - List of IDs: Only process creatives whose IDs appear in both payload AND this filter
+        delete_missing: Delete creatives not in sync payload (use with caution)
+        dry_run: Preview changes without applying them
+        validation_mode: Validation strictness (strict or lenient)
+        push_notification_config: Push notification config for status updates (AdCP spec, optional)
+        context: Application level context per adcp spec
+        identity: ResolvedIdentity with principal/tenant info (transport-agnostic)
+
+    Returns:
+        SyncCreativesResponse with synced creatives and assignments
+    """
+    from pydantic import ValidationError
+
+    # Phase 1a: Models flow through to helpers (which convert via isinstance guard).
+    # No model_dump at orchestrator level — helpers handle dict conversion transitionally.
+
+    # AdCP 2.5: Filter creatives by creative_ids if provided
+    # This allows scoped updates to specific creatives without affecting others
+    if creative_ids:
+        creative_ids_set = set(creative_ids)
+        creatives = [c for c in creatives if _get_field(c, "creative_id") in creative_ids_set]
+        logger.info(f"[sync_creatives] Filtered to {len(creatives)} creatives by creative_ids filter")
+
+    start_time = time.time()
+
+    # Authentication — principal_id is required for creative sync (NOT NULL in database).
+    # require_principal_id first so the canonical auth message surfaces for missing/anonymous auth;
+    # require_identity narrows the type. Tenant is resolved at the transport boundary.
+    principal_id = require_principal_id(identity, context=context)
+    identity = require_identity(identity, context=context)
+    tenant = require_tenant(identity, context=context)
+
+    # Track actions per creative for AdCP-compliant response
+
+    results: list[SyncCreativeResult] = []
+    created_count = 0
+    updated_count = 0
+    unchanged_count = 0
+    failed_count = 0
+    deleted_count = 0
+
+    # Legacy tracking (still used internally)
+    synced_creatives = []
+    failed_creatives: list[dict[str, Any]] = []
+
+    # Track creatives requiring approval for workflow creation
+    creatives_needing_approval = []
+
+    # Extract webhook URL from push_notification_config for AI review callbacks
+    webhook_url = None
+    if push_notification_config:
+        # Transitional: accept both PushNotificationConfig model and dict
+        if isinstance(push_notification_config, dict):
+            webhook_url = push_notification_config.get("url")
+        else:
+            webhook_url = str(push_notification_config.url) if push_notification_config.url else None
+        logger.info(f"[sync_creatives] Push notification webhook URL: {webhook_url}")
+
+    # Get tenant creative approval settings
+    # approval_mode: "auto-approve", "require-human", "ai-powered"
+    logger.info(f"[sync_creatives] Tenant dict keys: {list(tenant.keys())}")
+    logger.info(f"[sync_creatives] Tenant approval_mode field: {tenant.get('approval_mode', 'NOT FOUND')}")
+    approval_mode = tenant.get("approval_mode", "require-human")
+    logger.info(f"[sync_creatives] Final approval mode: {approval_mode} (from tenant: {tenant.get('tenant_id')})")
+
+    # Fetch creative formats ONCE before processing loop (outside any transaction)
+    # This avoids async HTTP calls inside database savepoints which cause transaction errors
+    from src.core.creative_agent_registry import get_creative_agent_registry
+
+    registry = get_creative_agent_registry()
+    all_formats = run_async_in_sync_context(registry.list_all_formats(tenant_id=tenant["tenant_id"]))
+
+    with CreativeUoW(tenant["tenant_id"]) as uow:
+        assert uow.creatives is not None
+        creative_repo = uow.creatives
+
+        # Check if any product in this tenant requires AI provenance metadata
+        provenance_policies = creative_repo.get_provenance_policies()
+        tenant_requires_provenance = len(provenance_policies) > 0
+        if tenant_requires_provenance:
+            logger.info(
+                f"[sync_creatives] Tenant {tenant['tenant_id']} has "
+                f"{len(provenance_policies)} product(s) requiring AI provenance"
+            )
+
+        # Process each creative with proper transaction isolation
+        for raw_creative in creatives:
+            try:
+                # Normalize to CreativeAsset model (handles dicts from A2A raw, BaseModel subclasses)
+                if isinstance(raw_creative, CreativeAsset):
+                    creative = raw_creative
+                elif isinstance(raw_creative, dict):
+                    # Default required fields for raw dicts missing them
+                    creative_data = raw_creative.copy()
+                    creative_data.setdefault("assets", {})
+                    creative = CreativeAsset(**creative_data)
+                else:
+                    creative = CreativeAsset.model_validate(raw_creative, from_attributes=True)
+
+                # Validate the creative against schema and business rules
+                try:
+                    validated_creative = _validate_creative_input(creative, registry, principal_id)
+                    format_value = validated_creative.format
+
+                except (ValidationError, ValueError) as validation_error:
+                    # Creative failed validation - add to failed list
+                    creative_id = creative.creative_id or "unknown"
+                    # Format ValidationError nicely for clients, pass through ValueError as-is
+                    if isinstance(validation_error, ValidationError):
+                        error_msg = format_validation_error(validation_error, context=f"creative {creative_id}")
+                    else:
+                        error_msg = str(validation_error)
+                    failed_creatives.append({"creative_id": creative_id, "error": error_msg})
+                    failed_count += 1
+                    results.append(_failed_sync_result(creative_id, error_msg))
+                    continue  # Skip to next creative
+
+                # Check provenance requirement (EU AI Act Article 50)
+                provenance_warning = None
+                if tenant_requires_provenance:
+                    # Use the first matching policy (tenant-wide enforcement)
+                    provenance_warning = check_provenance_required(validated_creative, provenance_policies[0])
+
+                # dry_run: build simulated results without DB writes
+                if dry_run:
+                    creative_id = creative.creative_id or "unknown"
+                    # Check if creative exists (read-only) to determine would-create vs would-update
+                    existing_creative = None
+                    if creative.creative_id:
+                        existing_creative = creative_repo.get_by_id(creative.creative_id, principal_id)
+
+                    if existing_creative:
+                        updated_count += 1
+                        results.append(
+                            SyncCreativeResult(
+                                creative_id=creative_id,
+                                action=CreativeAction.updated,
+                                status=existing_creative.status,
+                                platform_id=None,
+                                review_feedback=None,
+                                assigned_to=None,
+                                assignment_errors=None,
+                            )
+                        )
+                    else:
+                        created_count += 1
+                        results.append(
+                            SyncCreativeResult(
+                                creative_id=creative_id,
+                                action=CreativeAction.created,
+                                status=None,
+                                platform_id=None,
+                                review_feedback=None,
+                                assigned_to=None,
+                                assignment_errors=None,
+                            )
+                        )
+                    synced_creatives.append(creative)
+                    continue
+
+                # Use savepoint for individual creative transaction isolation
+                with creative_repo.begin_nested():
+                    # Check if creative already exists (always check for upsert/patch behavior)
+                    # SECURITY: Must filter by principal_id to prevent cross-principal modification
+                    existing_creative = None
+                    if creative.creative_id:
+                        existing_creative = creative_repo.get_by_id(creative.creative_id, principal_id)
+
+                    if existing_creative:
+                        update_result, needs_approval = _update_existing_creative(
+                            creative=creative,
+                            existing_creative=existing_creative,
+                            creative_repo=creative_repo,
+                            format_value=format_value,
+                            approval_mode=approval_mode,
+                            tenant=tenant,
+                            webhook_url=webhook_url,
+                            context=context,
+                            all_formats=all_formats,
+                            registry=registry,
+                            principal_id=principal_id,
+                        )
+
+                        # Handle failed updates
+                        if update_result.action == "failed":
+                            failed_creatives.append(
+                                {
+                                    "creative_id": existing_creative.creative_id,
+                                    "error": update_result.errors[0] if update_result.errors else "Unknown error",
+                                    "format": creative.format_id,
+                                }
+                            )
+                            failed_count += 1
+                            results.append(update_result)
+                            continue
+
+                        # Track counts
+                        if update_result.action == "updated":
+                            updated_count += 1
+                        else:
+                            unchanged_count += 1
+
+                        # Track creatives needing approval for workflow creation
+                        if needs_approval:
+                            creative_info: dict[str, Any] = {
+                                "creative_id": existing_creative.creative_id,
+                                "format": creative.format_id,
+                                "name": creative.name,
+                                "status": existing_creative.status,
+                            }
+                            # Include AI review reason if available
+                            if (
+                                approval_mode == "ai-powered"
+                                and existing_creative.data
+                                and existing_creative.data.get("ai_review")
+                            ):
+                                creative_info["ai_review_reason"] = existing_creative.data["ai_review"].get("reason")
+                            creatives_needing_approval.append(creative_info)
+
+                        # Add provenance warning if applicable
+                        if provenance_warning and update_result.action != "failed":
+                            update_result.warnings.append(provenance_warning)
+                            # Flag for review when provenance is missing
+                            existing_creative.status = "pending_review"
+                            needs_approval = True
+
+                        results.append(update_result)
+
+                    else:
+                        # Create new creative
+                        create_result, needs_approval = _create_new_creative(
+                            creative=creative,
+                            creative_repo=creative_repo,
+                            format_value=format_value,
+                            approval_mode=approval_mode,
+                            tenant=tenant,
+                            webhook_url=webhook_url,
+                            context=context,
+                            all_formats=all_formats,
+                            registry=registry,
+                            principal_id=principal_id,
+                        )
+
+                        # Handle failed creates
+                        if create_result.action == "failed":
+                            creative_id = creative.creative_id or "unknown"
+                            failed_creatives.append(
+                                {
+                                    "creative_id": creative_id,
+                                    "error": create_result.errors[0] if create_result.errors else "Unknown error",
+                                    "format": creative.format_id,
+                                }
+                            )
+                            failed_count += 1
+                            results.append(create_result)
+                            continue
+
+                        # Track counts
+                        created_count += 1
+
+                        # Track creatives needing approval for workflow creation
+                        if needs_approval:
+                            creative_info = {
+                                "creative_id": create_result.creative_id,
+                                "format": creative.format_id,
+                                "name": creative.name,
+                                "status": create_result.status,
+                            }
+                            # AI review reason will be added asynchronously when review completes
+                            # No ai_result available yet in async mode
+                            creatives_needing_approval.append(creative_info)
+
+                        # Add provenance warning if applicable
+                        if provenance_warning and create_result.action != "failed":
+                            create_result.warnings.append(provenance_warning)
+                            needs_approval = True
+
+                        results.append(create_result)
+
+                    # If we reach here, creative processing succeeded
+                    synced_creatives.append(creative)
+
+            except Exception as e:
+                # Savepoint automatically rolls back this creative only
+                creative_id = _get_field(raw_creative, "creative_id", "unknown")
+                error_msg = str(e)
+                failed_creatives.append(
+                    {"creative_id": creative_id, "name": _get_field(raw_creative, "name"), "error": error_msg}
+                )
+                failed_count += 1
+                results.append(_failed_sync_result(creative_id, error_msg))
+
+        # Archive creatives not in the sync payload when delete_missing=True
+        if delete_missing:
+            # Collect all creative IDs from the payload (regardless of success/failure)
+            payload_creative_ids = {_get_field(c, "creative_id") for c in creatives}
+            payload_creative_ids.discard(None)
+
+            # Query for existing creatives belonging to this tenant+principal
+            # that are NOT in the payload and NOT already archived
+            existing_creatives = creative_repo.list_by_principal(principal_id)
+
+            for db_creative in existing_creatives:
+                if db_creative.creative_id not in payload_creative_ids and db_creative.status != "archived":
+                    if not dry_run:
+                        db_creative.status = "archived"
+                    deleted_count += 1
+                    results.append(
+                        SyncCreativeResult(
+                            creative_id=db_creative.creative_id,
+                            action=CreativeAction.deleted,
+                            status=None,
+                            platform_id=None,
+                            review_feedback=None,
+                            assigned_to=None,
+                            assignment_errors=None,
+                        )
+                    )
+
+        # CreativeUoW auto-commits on clean exit — no explicit commit needed
+
+    # Process assignments (spec-compliant: creative_id → package_ids mapping)
+    assignment_list = _process_assignments(
+        assignments=assignments,
+        results=results,
+        tenant=tenant,
+        validation_mode=validation_mode,
+        principal_id=principal_id,
+    )
+
+    # Create workflow steps and send notifications for creatives requiring approval
+    # Skip in dry_run mode — no side effects
+    if creatives_needing_approval and not dry_run:
+        _create_sync_workflow_steps(
+            creatives_needing_approval=creatives_needing_approval,
+            principal_id=principal_id,
+            tenant=tenant,
+            approval_mode=approval_mode,
+            push_notification_config=push_notification_config,
+            context=context,
+            identity=identity,
+        )
+        _send_creative_notifications(
+            creatives_needing_approval=creatives_needing_approval,
+            tenant=tenant,
+            approval_mode=approval_mode,
+            principal_id=principal_id,
+        )
+
+    # Audit logging
+    _audit_log_sync(
+        tenant=tenant,
+        principal_id=principal_id,
+        synced_creatives=synced_creatives,
+        failed_creatives=failed_creatives,
+        assignment_list=assignment_list,
+        creative_ids=creative_ids,
+        dry_run=dry_run,
+        created_count=created_count,
+        updated_count=updated_count,
+        unchanged_count=unchanged_count,
+        failed_count=failed_count,
+        creatives_needing_approval=creatives_needing_approval,
+    )
+
+    # Log activity
+    if identity is not None:
+        log_tool_activity(identity, "sync_creatives", start_time)
+
+    # Build message
+    message = f"Synced {created_count + updated_count} creatives"
+    if created_count:
+        message += f" ({created_count} created"
+        if updated_count:
+            message += f", {updated_count} updated"
+        message += ")"
+    elif updated_count:
+        message += f" ({updated_count} updated)"
+    if unchanged_count:
+        message += f", {unchanged_count} unchanged"
+    if deleted_count:
+        message += f", {deleted_count} archived"
+    if failed_count:
+        message += f", {failed_count} failed"
+    if assignment_list:
+        message += f", {len(assignment_list)} assignments created"
+    if creatives_needing_approval:
+        message += f", {len(creatives_needing_approval)} require approval"
+
+    # Build AdCP-compliant response (per official spec)
+    return SyncCreativesResponse(
+        creatives=results,
+        dry_run=dry_run,
+        context=context,
+    )

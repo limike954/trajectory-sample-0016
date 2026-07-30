@@ -1,0 +1,453 @@
+"""Integration test for GAM pricing model restrictions (AdCP PR #88).
+
+Tests that GAM adapter properly enforces CPM-only restriction.
+
+NOTE: These tests connect to external creative agents (creative.adcontextprotocol.org)
+for format lookup. If these services are unavailable (HTTP 5xx, connection errors),
+tests will skip rather than fail, since external service availability is outside
+our control.
+
+# --- Test Source-of-Truth Audit ---
+# Audited: 2026-03-08
+#
+# SPEC_BACKED (4/4 tests):
+#   test_gam_rejects_cpcv_pricing_model
+#     — AdCP spec: INVALID_PRICING_MODEL error code; CPCV not in GAM's
+#       PricingCompatibility.ADCP_TO_GAM_COST_TYPE (GAM API: ForecastService.CostType)
+#   test_gam_accepts_cpm_pricing_model
+#     — AdCP spec: CPM is a defined pricing model; GAM supports CPM natively
+#   test_gam_rejects_cpp_from_multi_pricing_product
+#     — AdCP spec: INVALID_PRICING_MODEL error code; CPP not in GAM's
+#       PricingCompatibility.ADCP_TO_GAM_COST_TYPE
+#   test_gam_accepts_cpm_from_multi_pricing_product
+#     — AdCP spec: CPM is a defined pricing model; GAM supports CPM natively
+# ---
+"""
+
+import uuid
+from datetime import UTC, datetime, timedelta
+from decimal import Decimal
+
+import pytest
+
+from src.core.database.database_session import get_db_session
+from src.core.database.models import (
+    AdapterConfig,
+    CurrencyLimit,
+    GAMInventory,
+    MediaBuy,
+    MediaPackage,
+    PricingOption,
+    Principal,
+    Product,
+    PropertyTag,
+    Tenant,
+)
+from src.core.resolved_identity import ResolvedIdentity
+from src.core.schemas import CreateMediaBuyRequest
+from src.core.testing_hooks import AdCPTestContext
+from tests.helpers.adcp_factories import create_test_package_request
+from tests.helpers.external_service import is_external_service_response_error
+from tests.utils.database_helpers import create_tenant_with_timestamps
+
+# Tests are now AdCP 2.4 compliant (removed status field, using errors field)
+pytestmark = [pytest.mark.integration, pytest.mark.requires_db]
+
+
+def _get_future_date_range() -> tuple[str, str]:
+    """Get a valid future date range for tests.
+
+    Returns start_time (tomorrow) and end_time (30 days from now) as ISO strings.
+    """
+    tomorrow = datetime.now(UTC) + timedelta(days=1)
+    end_date = tomorrow + timedelta(days=30)
+    start_time = tomorrow.strftime("%Y-%m-%dT00:00:00Z")
+    end_time = end_date.strftime("%Y-%m-%dT23:59:59Z")
+    return start_time, end_time
+
+
+@pytest.fixture
+def setup_gam_tenant_with_non_cpm_product(integration_db):
+    """Create a GAM tenant with a product offering non-CPM pricing."""
+    with get_db_session() as session:
+        # Create GAM tenant
+        # Note: human_review_required=False ensures media buy validation runs immediately
+        # rather than going to approval workflow (needed for pricing validation tests)
+        tenant = create_tenant_with_timestamps(
+            tenant_id="test_gam_tenant",
+            name="GAM Test Publisher",
+            subdomain="gam-test",
+            ad_server="google_ad_manager",
+            human_review_required=False,
+        )
+        session.add(tenant)
+        session.flush()
+
+        # Add adapter config (mock mode for testing)
+        adapter_config = AdapterConfig(
+            tenant_id="test_gam_tenant",
+            adapter_type="google_ad_manager",
+            gam_network_code="123456",
+            gam_trafficker_id="987654",
+        )
+        session.add(adapter_config)
+
+        # Add currency limit
+        currency_limit = CurrencyLimit(
+            tenant_id="test_gam_tenant",
+            currency_code="USD",
+            max_daily_package_spend=Decimal("50000.00"),
+        )
+        session.add(currency_limit)
+
+        # Add property tag (required for products)
+        property_tag = PropertyTag(
+            tenant_id="test_gam_tenant",
+            tag_id="all_inventory",
+            name="All Inventory",
+            description="All available inventory",
+        )
+        session.add(property_tag)
+
+        # Create principal
+        principal = Principal(
+            tenant_id="test_gam_tenant",
+            principal_id="test_advertiser",
+            name="Test Advertiser",
+            access_token="test_gam_token",
+            platform_mappings={"google_ad_manager": {"advertiser_id": "987654321"}},
+        )
+        session.add(principal)
+
+        # Add GAM inventory (required for product validation)
+        # Note: Using numeric ID as GAM requires numeric ad unit IDs
+        gam_inventory = GAMInventory(
+            tenant_id="test_gam_tenant",
+            inventory_type="ad_unit",
+            inventory_id="23312403856",
+            name="Test Ad Unit for Pricing Tests",
+            path=["test"],
+            status="active",
+            inventory_metadata={},
+        )
+        session.add(gam_inventory)
+
+        # Create product with CPCV pricing (not supported by GAM)
+        product = Product(
+            tenant_id="test_gam_tenant",
+            product_id="prod_gam_cpcv",
+            name="Video Ads - CPCV",
+            description="Video inventory with CPCV pricing",
+            format_ids=[
+                {
+                    "agent_url": "https://creative.adcontextprotocol.org",
+                    "id": "video_standard_30s",
+                }
+            ],
+            delivery_type="non_guaranteed",
+            property_tags=["all_inventory"],
+            targeting_template={},
+            implementation_config={
+                "targeted_ad_unit_ids": ["23312403856"],
+                "line_item_type": "STANDARD",
+                "priority": 8,
+                "creative_placeholders": [{"width": 300, "height": 250}],
+            },
+        )
+        session.add(product)
+        session.flush()
+
+        # Add CPCV pricing option
+        pricing_cpcv = PricingOption(
+            tenant_id="test_gam_tenant",
+            product_id="prod_gam_cpcv",
+            pricing_model="cpcv",
+            rate=Decimal("0.40"),
+            currency="USD",
+            is_fixed=True,
+            price_guidance=None,
+            parameters=None,
+            min_spend_per_package=None,
+        )
+        session.add(pricing_cpcv)
+
+        # Create product with CPM pricing (supported by GAM)
+        product_cpm = Product(
+            tenant_id="test_gam_tenant",
+            product_id="prod_gam_cpm",
+            name="Display Ads - CPM",
+            description="Display inventory with CPM pricing",
+            format_ids=[
+                {
+                    "agent_url": "https://creative.adcontextprotocol.org",
+                    "id": "display_300x250_image",
+                }
+            ],
+            delivery_type="guaranteed",
+            property_tags=["all_inventory"],
+            targeting_template={},
+            implementation_config={
+                "targeted_ad_unit_ids": ["23312403856"],
+                "line_item_type": "STANDARD",
+                "priority": 8,
+                "creative_placeholders": [{"width": 300, "height": 250}],
+            },
+        )
+        session.add(product_cpm)
+        session.flush()
+
+        # Add CPM pricing option
+        pricing_cpm = PricingOption(
+            tenant_id="test_gam_tenant",
+            product_id="prod_gam_cpm",
+            pricing_model="cpm",
+            rate=Decimal("12.50"),
+            currency="USD",
+            is_fixed=True,
+            price_guidance=None,
+            parameters=None,
+            min_spend_per_package=None,
+        )
+        session.add(pricing_cpm)
+
+        # Create product with multiple pricing models including non-CPM
+        product_multi = Product(
+            tenant_id="test_gam_tenant",
+            product_id="prod_gam_multi",
+            name="Premium Package",
+            description="Multiple pricing models (some unsupported)",
+            format_ids=[
+                {
+                    "agent_url": "https://creative.adcontextprotocol.org",
+                    "id": "display_300x250_image",
+                },
+                {
+                    "agent_url": "https://creative.adcontextprotocol.org",
+                    "id": "video_standard_30s",
+                },
+            ],
+            delivery_type="non_guaranteed",
+            property_tags=["all_inventory"],
+            targeting_template={},
+            implementation_config={
+                "targeted_ad_unit_ids": ["23312403856"],
+                "line_item_type": "PRICE_PRIORITY",
+                "priority": 12,
+                "creative_placeholders": [{"width": 300, "height": 250}],
+                "format_overrides": {
+                    "video_standard_30s": {
+                        "platform_config": {"gam": {"creative_placeholder": {"width": 640, "height": 480}}},
+                    }
+                },
+            },
+        )
+        session.add(product_multi)
+        session.flush()
+
+        # Add CPM (supported)
+        pricing_multi_cpm = PricingOption(
+            tenant_id="test_gam_tenant",
+            product_id="prod_gam_multi",
+            pricing_model="cpm",
+            rate=Decimal("15.00"),
+            currency="USD",
+            is_fixed=True,
+            price_guidance=None,
+            parameters=None,
+            min_spend_per_package=None,
+        )
+        session.add(pricing_multi_cpm)
+
+        # Add CPP (not supported by GAM)
+        pricing_multi_cpp = PricingOption(
+            tenant_id="test_gam_tenant",
+            product_id="prod_gam_multi",
+            pricing_model="cpp",
+            rate=Decimal("250.00"),
+            currency="USD",
+            is_fixed=True,
+            price_guidance=None,
+            parameters={"demographic": "A18-49"},
+            min_spend_per_package=None,
+        )
+        session.add(pricing_multi_cpp)
+
+        session.commit()
+
+    yield
+
+    # Cleanup
+    with get_db_session() as session:
+        from sqlalchemy import delete, select
+
+        # Delete media packages first (join through media_buy to filter by tenant)
+        media_buy_ids_stmt = select(MediaBuy.media_buy_id).where(MediaBuy.tenant_id == "test_gam_tenant")
+        media_buy_ids = [row[0] for row in session.execute(media_buy_ids_stmt)]
+        if media_buy_ids:
+            session.execute(delete(MediaPackage).where(MediaPackage.media_buy_id.in_(media_buy_ids)))
+
+        # Delete in order of foreign key dependencies
+        session.execute(delete(MediaBuy).where(MediaBuy.tenant_id == "test_gam_tenant"))
+        session.execute(delete(PricingOption).where(PricingOption.tenant_id == "test_gam_tenant"))
+        session.execute(delete(Product).where(Product.tenant_id == "test_gam_tenant"))
+        session.execute(delete(PropertyTag).where(PropertyTag.tenant_id == "test_gam_tenant"))
+        session.execute(delete(Principal).where(Principal.tenant_id == "test_gam_tenant"))
+        session.execute(delete(AdapterConfig).where(AdapterConfig.tenant_id == "test_gam_tenant"))
+        session.execute(delete(CurrencyLimit).where(CurrencyLimit.tenant_id == "test_gam_tenant"))
+        session.execute(delete(Tenant).where(Tenant.tenant_id == "test_gam_tenant"))
+        session.commit()
+
+
+@pytest.mark.requires_db
+async def test_gam_rejects_cpcv_pricing_model(setup_gam_tenant_with_non_cpm_product):
+    """Test that GAM adapter rejects CPCV pricing model with clear error."""
+    start_time, end_time = _get_future_date_range()
+    request = CreateMediaBuyRequest(
+        brand={"domain": "testbrand.com"},
+        idempotency_key=f"int-key-{uuid.uuid4().hex}",
+        packages=[
+            create_test_package_request(
+                product_id="prod_gam_cpcv",
+                pricing_option_id="cpcv_usd_fixed",  # Generated format: {model}_{currency}_{fixed|auction}
+                budget=10000.0,
+            )
+        ],
+        start_time=start_time,
+        end_time=end_time,
+    )
+
+    identity = ResolvedIdentity(
+        principal_id="test_advertiser",
+        tenant_id="test_gam_tenant",
+        tenant={"tenant_id": "test_gam_tenant"},
+        testing_context=AdCPTestContext(dry_run=True, test_session_id="test_session"),
+        protocol="mcp",
+    )
+
+    from src.core.exceptions import AdCPValidationError
+    from src.core.tools.media_buy_create import _create_media_buy_impl
+
+    # GAM adapter rejects unsupported pricing models — _impl raises AdCPValidationError
+    with pytest.raises(AdCPValidationError, match="(?i)cpcv|pricing|not support"):
+        await _create_media_buy_impl(req=request, identity=identity)
+
+
+@pytest.mark.requires_db
+async def test_gam_accepts_cpm_pricing_model(setup_gam_tenant_with_non_cpm_product):
+    """Test that GAM adapter accepts CPM pricing model."""
+    from src.core.tools.media_buy_create import _create_media_buy_impl
+
+    start_time, end_time = _get_future_date_range()
+    request = CreateMediaBuyRequest(
+        brand={"domain": "testbrand.com"},
+        idempotency_key=f"int-key-{uuid.uuid4().hex}",
+        packages=[
+            create_test_package_request(
+                product_id="prod_gam_cpm",
+                pricing_option_id="cpm_usd_fixed",  # Generated format: {model}_{currency}_{fixed|auction}
+                budget=10000.0,
+            )
+        ],
+        start_time=start_time,
+        end_time=end_time,
+    )
+
+    identity = ResolvedIdentity(
+        principal_id="test_advertiser",
+        tenant_id="test_gam_tenant",
+        tenant={"tenant_id": "test_gam_tenant"},
+        testing_context=AdCPTestContext(dry_run=True, test_session_id="test_session"),
+        protocol="mcp",
+    )
+
+    # This should succeed
+    response, _ = await _create_media_buy_impl(req=request, identity=identity)
+
+    # Verify response is success (AdCP 2.4 compliant)
+    # Success response has media_buy_id, error response has errors field
+    # Skip if external creative agent is unavailable
+    if is_external_service_response_error(response):
+        pytest.skip(f"External creative agent unavailable: {response.errors}")
+
+    assert not hasattr(response, "errors") or response.errors is None or response.errors == [], (
+        f"Media buy creation failed: {response.errors if hasattr(response, 'errors') else 'unknown error'}"
+    )
+    assert response.media_buy_id is not None
+
+
+@pytest.mark.requires_db
+async def test_gam_rejects_cpp_from_multi_pricing_product(setup_gam_tenant_with_non_cpm_product):
+    """Test that GAM adapter rejects CPP when buyer chooses it from multi-pricing product."""
+    from src.core.tools.media_buy_create import _create_media_buy_impl
+
+    start_time, end_time = _get_future_date_range()
+    request = CreateMediaBuyRequest(
+        brand={"domain": "testbrand.com"},
+        idempotency_key=f"int-key-{uuid.uuid4().hex}",
+        packages=[
+            create_test_package_request(
+                product_id="prod_gam_multi",
+                pricing_option_id="cpp_usd_fixed",  # Generated format: {model}_{currency}_{fixed|auction}
+                budget=15000.0,
+            )
+        ],
+        start_time=start_time,
+        end_time=end_time,
+    )
+
+    identity = ResolvedIdentity(
+        principal_id="test_advertiser",
+        tenant_id="test_gam_tenant",
+        tenant={"tenant_id": "test_gam_tenant"},
+        testing_context=AdCPTestContext(dry_run=True, test_session_id="test_session"),
+        protocol="mcp",
+    )
+
+    from src.core.exceptions import AdCPValidationError
+
+    # GAM adapter rejects unsupported pricing models — _impl raises AdCPValidationError
+    with pytest.raises(AdCPValidationError, match="(?i)cpp|pricing|not support"):
+        await _create_media_buy_impl(req=request, identity=identity)
+
+
+@pytest.mark.requires_db
+async def test_gam_accepts_cpm_from_multi_pricing_product(setup_gam_tenant_with_non_cpm_product):
+    """Test that GAM adapter accepts CPM when buyer chooses it from multi-pricing product."""
+    from src.core.tools.media_buy_create import _create_media_buy_impl
+
+    start_time, end_time = _get_future_date_range()
+    request = CreateMediaBuyRequest(
+        brand={"domain": "testbrand.com"},
+        idempotency_key=f"int-key-{uuid.uuid4().hex}",
+        packages=[
+            create_test_package_request(
+                product_id="prod_gam_multi",
+                pricing_option_id="cpm_usd_fixed",  # Generated format: {model}_{currency}_{fixed|auction}
+                budget=10000.0,
+            )
+        ],
+        start_time=start_time,
+        end_time=end_time,
+    )
+
+    identity = ResolvedIdentity(
+        principal_id="test_advertiser",
+        tenant_id="test_gam_tenant",
+        tenant={"tenant_id": "test_gam_tenant"},
+        testing_context=AdCPTestContext(dry_run=True, test_session_id="test_session"),
+        protocol="mcp",
+    )
+
+    # This should succeed - buyer chose CPM from multi-option product
+    response, _ = await _create_media_buy_impl(req=request, identity=identity)
+
+    # Verify response is success (AdCP 2.4 compliant)
+    # Success response has media_buy_id, error response has errors field
+    # Skip if external creative agent is unavailable
+    if is_external_service_response_error(response):
+        pytest.skip(f"External creative agent unavailable: {response.errors}")
+
+    assert not hasattr(response, "errors") or response.errors is None or response.errors == [], (
+        f"Media buy creation failed: {response.errors if hasattr(response, 'errors') else 'unknown error'}"
+    )
+    assert response.media_buy_id is not None

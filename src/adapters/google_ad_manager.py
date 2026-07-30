@@ -1,0 +1,1713 @@
+"""
+Google Ad Manager (GAM) Adapter - Refactored Version
+
+This is the refactored Google Ad Manager adapter that uses a modular architecture.
+The main adapter class acts as an orchestrator, delegating specific operations
+to specialized manager classes.
+"""
+
+# Export constants for backward compatibility
+__all__ = [
+    "GUARANTEED_LINE_ITEM_TYPES",
+    "NON_GUARANTEED_LINE_ITEM_TYPES",
+]
+
+import logging
+import uuid
+from datetime import datetime
+from typing import TYPE_CHECKING, Any, Literal, cast
+
+import sqlalchemy.exc
+
+if TYPE_CHECKING:
+    from src.core.schemas import Snapshot
+
+from flask import Flask
+
+from src.adapters.base import AdapterCapabilities, AdServerAdapter, TargetingCapabilities
+
+# Import modular components
+from src.adapters.gam.client import GAMClientManager
+from src.adapters.gam.managers import (
+    GAMCreativesManager,
+    GAMInventoryManager,
+    GAMOrdersManager,
+    GAMSyncManager,
+    GAMTargetingManager,
+    GAMWorkflowManager,
+)
+
+# Re-export constants for backward compatibility
+from src.adapters.gam.managers.orders import (
+    GUARANTEED_LINE_ITEM_TYPES,
+    NON_GUARANTEED_LINE_ITEM_TYPES,
+)
+from src.adapters.gam.pricing_compatibility import PricingCompatibility
+from src.adapters.gam_data_freshness import validate_and_log_freshness
+from src.core.audit_logger import AuditLogger
+from src.core.exceptions import (
+    AdCPActivationWorkflowError,
+    AdCPAdapterError,
+    AdCPAuthorizationError,
+    AdCPBudgetExceededError,
+    AdCPBulkUpdateError,
+    AdCPCapabilityNotSupportedError,
+    AdCPConfigurationError,
+    AdCPError,
+    AdCPGamUpdateError,
+    AdCPLineItemError,
+    AdCPPackageNotFoundError,
+    AdCPProductUnavailableError,
+    AdCPValidationError,
+    AdCPWorkflowError,
+)
+from src.core.schemas import (
+    AdapterGetMediaBuyDeliveryResponse,
+    AffectedPackage,
+    AssetStatus,
+    CheckMediaBuyStatusResponse,
+    CreateMediaBuyRequest,
+    CreateMediaBuyResponse,
+    MediaPackage,
+    ReportingPeriod,
+    UpdateMediaBuyResponse,
+    UpdateMediaBuySuccess,
+)
+
+# Set up logger
+logger = logging.getLogger(__name__)
+
+
+class GoogleAdManager(AdServerAdapter):
+    """Google Ad Manager adapter using modular architecture."""
+
+    adapter_name = "google_ad_manager"
+
+    capabilities = AdapterCapabilities(
+        supports_realtime_reporting=True,  # Snapshots via cached GAM line item stats
+    )
+
+    # GAM supports display, olv (online video), and social advertising
+    # V3 channel names: video → olv, native → social
+    default_channels = ["display", "olv", "social"]
+
+    # GAM provides its own delivery measurement via Google Ad Manager reporting
+    default_delivery_measurement = {
+        "provider": "google_ad_manager",
+        "notes": "Delivery measured by Google Ad Manager ad serving and reporting",
+    }
+
+    def __init__(
+        self,
+        config: dict[str, Any],
+        principal,
+        *,
+        network_code: str,
+        advertiser_id: str | None = None,
+        trafficker_id: str | None = None,
+        dry_run: bool = False,
+        audit_logger: AuditLogger | None = None,
+        tenant_id: str | None = None,
+        targeting_config: dict[str, Any] | None = None,
+        naming_templates: tuple[str | None, str | None] | None = None,
+    ):
+        """Initialize Google Ad Manager adapter with modular managers.
+
+        Args:
+            config: Configuration dictionary
+            principal: Principal object for authentication
+            network_code: GAM network code
+            advertiser_id: GAM advertiser ID (optional, required only for order/campaign operations)
+            trafficker_id: GAM trafficker ID (optional, required only for order/campaign operations)
+            dry_run: Whether to run in dry-run mode
+            audit_logger: Audit logging instance
+            tenant_id: Tenant identifier
+            targeting_config: Pre-loaded targeting config from AdapterConfigRepository.
+                If None, uses empty defaults (caller should pre-load via repository).
+            naming_templates: Pre-loaded (order_template, line_item_template) tuple.
+                If None, uses (None, None) defaults.
+        """
+        super().__init__(config, principal, dry_run, None, tenant_id)
+        assert self.tenant_id is not None  # Guaranteed by base class validation
+
+        self.network_code = network_code
+        self.advertiser_id = advertiser_id
+        self.trafficker_id = trafficker_id
+        self.refresh_token = config.get("refresh_token")
+        self.key_file = config.get("service_account_key_file")
+        self.service_account_json = config.get("service_account_json")
+        self.principal = principal
+
+        # Validate configuration
+        self.network_code = self._require_config(
+            self.network_code,
+            field="network_code",
+            message="GAM config is missing 'network_code'",
+        )
+
+        # Validate advertiser_id is numeric if provided (GAM expects integer company IDs)
+        if advertiser_id is not None and advertiser_id != "":
+            # Format check (distinct from the _require_config presence guards above):
+            # advertiser_id is optional, but if provided it must parse as an integer.
+            try:
+                int(advertiser_id)
+            except (ValueError, TypeError) as e:
+                raise AdCPConfigurationError(
+                    f"GAM advertiser_id must be numeric (got: '{advertiser_id}'). "
+                    f"Check principal platform_mappings configuration.",
+                    field="advertiser_id",
+                ) from e
+
+        # advertiser_id is only required for order/campaign operations, not inventory sync
+
+        # Use pre-loaded config from caller (no DB query in __init__)
+        self._targeting_config = targeting_config
+        self._order_name_template: str | None = naming_templates[0] if naming_templates else None
+        self._line_item_name_template: str | None = naming_templates[1] if naming_templates else None
+        self._placement_targeting_map: dict[str, str] = {}
+
+        # Skip auth validation in dry_run mode (for testing)
+        if not self.dry_run:
+            if not self.key_file and not self.service_account_json and not self.refresh_token:
+                raise AdCPConfigurationError(
+                    "GAM config is missing an authentication credential: set one of "
+                    "'service_account_key_file', 'service_account_json', or 'refresh_token'",
+                    field="authentication",
+                )
+
+        # Initialize modular components
+        if not self.dry_run:
+            self.client_manager = GAMClientManager(self.config, self.network_code)
+            # Legacy client property for backward compatibility
+            self.client = self.client_manager.get_client()
+
+            # Auto-detect trafficker_id if not provided
+            if not self.trafficker_id:
+                try:
+                    user_service = self.client.GetService("UserService")
+                    current_user = user_service.getCurrentUser()
+                    self.trafficker_id = str(current_user["id"])
+                    logger.info(
+                        f"Auto-detected trafficker_id: {self.trafficker_id} ({current_user.get('name', 'Unknown')})"
+                    )
+                except Exception as e:
+                    logger.warning(f"Could not auto-detect trafficker_id: {e}")
+
+            # Initialize manager components with pre-loaded config
+            self.targeting_manager = GAMTargetingManager(
+                self.tenant_id, gam_client=self.client, targeting_config=self._targeting_config
+            )
+
+            # Initialize orders manager (advertiser_id/trafficker_id optional for query operations)
+            self.orders_manager = GAMOrdersManager(self.client_manager, self.advertiser_id, self.trafficker_id, dry_run)
+
+            # Only initialize creative manager if we have advertiser_id (required for creative operations)
+            # Note: trafficker_id is NOT required for creative operations - only for order creation
+            if self.advertiser_id:
+                self.creatives_manager = GAMCreativesManager(
+                    self.client_manager, self.advertiser_id, dry_run, self.log, self
+                )
+            else:
+                self.creatives_manager = None  # type: ignore[assignment]
+
+            # Inventory manager doesn't need advertiser_id
+            self.inventory_manager = GAMInventoryManager(self.client_manager, self.tenant_id, dry_run)
+
+            # Sync manager only needs inventory manager for inventory sync
+            self.sync_manager = GAMSyncManager(
+                self.client_manager, self.inventory_manager, self.orders_manager, self.tenant_id, dry_run
+            )
+            self.workflow_manager = GAMWorkflowManager(self.tenant_id, principal, audit_logger, self.log)
+        else:
+            self.client_manager = None  # type: ignore[assignment]
+            self.client = None
+            self.log("[yellow]Running in dry-run mode - GAM client not initialized[/yellow]")
+
+            # Initialize managers for dry-run mode (they can work without real client)
+            self.targeting_manager = GAMTargetingManager(self.tenant_id, targeting_config=self._targeting_config)
+
+            # Initialize orders manager in dry-run mode
+            self.orders_manager = GAMOrdersManager(None, self.advertiser_id, self.trafficker_id, dry_run=True)
+
+            # Only initialize creative manager if we have advertiser_id (required for creative operations)
+            # Note: trafficker_id is NOT required for creative operations - only for order creation
+            if self.advertiser_id:
+                self.creatives_manager = GAMCreativesManager(
+                    None,
+                    self.advertiser_id,
+                    dry_run=True,
+                    log_func=self.log,
+                    adapter=self,
+                )
+            else:
+                self.creatives_manager = None  # type: ignore[assignment]
+
+            # Initialize inventory manager in dry-run mode
+            self.inventory_manager = GAMInventoryManager(None, self.tenant_id, dry_run=True)  # type: ignore[arg-type]
+
+            # Initialize sync manager in dry-run mode
+            self.sync_manager = GAMSyncManager(
+                None,  # type: ignore[arg-type]
+                self.inventory_manager,
+                self.orders_manager,
+                self.tenant_id,
+                dry_run=True,
+            )
+
+            # Initialize workflow manager (doesn't need client)
+            self.workflow_manager = GAMWorkflowManager(self.tenant_id, principal, audit_logger, self.log)
+
+        # Initialize legacy validator for backward compatibility
+        from .gam.utils.validation import GAMValidator
+
+        self.validator = GAMValidator()
+
+    # Legacy methods for backward compatibility - delegated to managers
+    def _init_client(self):
+        """Initializes the Ad Manager client (legacy - now handled by client manager)."""
+        if self.client_manager:
+            return self.client_manager.get_client()
+        return None
+
+    def _get_oauth_credentials(self):
+        """Get OAuth credentials (legacy - now handled by auth manager)."""
+        if self.client_manager:
+            return self.client_manager.auth_manager.get_credentials()
+        return None
+
+    # Legacy targeting methods - delegated to targeting manager
+    def _validate_targeting(self, targeting_overlay):
+        """Validate targeting and return unsupported features (delegated to targeting manager)."""
+        return self.targeting_manager.validate_targeting(targeting_overlay)
+
+    def _build_targeting(self, targeting_overlay):
+        """Build GAM targeting criteria from AdCP targeting (delegated to targeting manager)."""
+        return self.targeting_manager.build_targeting(targeting_overlay)
+
+    # HITL (Human-in-the-Loop) support methods
+    def _requires_manual_approval(self, operation: str) -> bool:
+        """Check if an operation requires manual approval based on configuration.
+
+        Args:
+            operation: The operation name (e.g., 'create_media_buy', 'add_creative_assets')
+
+        Returns:
+            bool: True if manual approval is required for this operation
+        """
+        return self.manual_approval_required and operation in self.manual_approval_operations
+
+    # Legacy admin/business logic methods for backward compatibility
+    def _is_admin_principal(self) -> bool:
+        """Check if the current principal has admin privileges."""
+        if not hasattr(self.principal, "platform_mappings"):
+            return False
+
+        gam_mappings = self.principal.platform_mappings.get("google_ad_manager", {})
+        return bool(gam_mappings.get("gam_admin", False) or gam_mappings.get("is_admin", False))
+
+    def _require_creatives_manager(self) -> GAMCreativesManager:
+        """Return the creatives manager, or raise if the adapter is not configured for it."""
+        manager = self.creatives_manager
+        if not manager:
+            raise AdCPConfigurationError(
+                "GAM adapter not configured for creative operations", field="creatives_manager"
+            )
+        return manager
+
+    def _require_orders_manager(self) -> GAMOrdersManager:
+        """Return the orders manager, or raise if the adapter is not configured for it."""
+        manager = self.orders_manager
+        if not manager:
+            raise AdCPConfigurationError("GAM adapter not configured for order operations", field="orders_manager")
+        return manager
+
+    def _validate_creative_for_gam(self, asset):
+        """Validate creative asset for GAM requirements (delegated to creatives manager)."""
+        return self._require_creatives_manager()._validate_creative_for_gam(asset)
+
+    def _get_creative_type(self, asset):
+        """Determine creative type from asset (delegated to creatives manager)."""
+        return self._require_creatives_manager()._get_creative_type(asset)
+
+    def _create_gam_creative(self, asset, creative_type, asset_placeholders):
+        """Create a GAM creative (delegated to creatives manager)."""
+        return self._require_creatives_manager()._create_gam_creative(asset, creative_type, asset_placeholders)
+
+    def _check_order_has_guaranteed_items(self, order_id):
+        """Check if order has guaranteed line items (delegated to orders manager)."""
+        return self._require_orders_manager().check_order_has_guaranteed_items(order_id)
+
+    def get_supported_pricing_models(self) -> set[str]:
+        """Return set of pricing models GAM adapter supports.
+
+        Google Ad Manager supports:
+        - CPM: All line item types
+        - VCPM: STANDARD only (viewable CPM)
+        - CPC: STANDARD, SPONSORSHIP, NETWORK, PRICE_PRIORITY
+        - FLAT_RATE: SPONSORSHIP (translated to CPD internally)
+
+        Returns:
+            Set of pricing model strings supported by this adapter
+        """
+        return {"cpm", "vcpm", "cpc", "flat_rate"}
+
+    def get_targeting_capabilities(self) -> TargetingCapabilities:
+        """Return targeting capabilities GAM adapter supports.
+
+        Google Ad Manager supports comprehensive geo targeting:
+        - Countries and regions worldwide
+        - Nielsen DMAs (US metros)
+        - US ZIP codes
+
+        Returns:
+            TargetingCapabilities describing GAM's targeting support
+        """
+        return TargetingCapabilities(
+            geo_countries=True,
+            geo_regions=True,
+            nielsen_dma=True,  # GAM supports US DMAs
+            us_zip=True,  # GAM supports US ZIP targeting
+        )
+
+    # Legacy properties for backward compatibility
+    @property
+    def GEO_COUNTRY_MAP(self):
+        return self.targeting_manager.geo_country_map
+
+    @property
+    def GEO_REGION_MAP(self):
+        return self.targeting_manager.geo_region_map
+
+    @property
+    def GEO_METRO_MAP(self):
+        return self.targeting_manager.geo_metro_map
+
+    @property
+    def DEVICE_TYPE_MAP(self):
+        return self.targeting_manager.DEVICE_TYPE_MAP
+
+    @property
+    def SUPPORTED_MEDIA_TYPES(self):
+        return self.targeting_manager.SUPPORTED_MEDIA_TYPES
+
+    def create_media_buy(
+        self,
+        request: CreateMediaBuyRequest,
+        packages: list[MediaPackage],
+        start_time: datetime,
+        end_time: datetime,
+        package_pricing_info: dict[str, dict] | None = None,
+    ) -> CreateMediaBuyResponse:
+        """Create a new media buy (order) in GAM - main orchestration method.
+
+        Args:
+            request: Full create media buy request
+            packages: Simplified package models
+            start_time: Campaign start time
+            end_time: Campaign end time
+            package_pricing_info: Optional validated pricing info (AdCP PR #88)
+                Maps package_id → {pricing_model, rate, currency, is_fixed, bid_price}
+
+        Returns:
+            CreateMediaBuyResponse with GAM order details
+        """
+        self.log("[bold]GoogleAdManager.create_media_buy[/bold] - Creating GAM order")
+
+        # Validate pricing models - check GAM compatibility
+        if package_pricing_info:
+            for pkg_id, pricing in package_pricing_info.items():
+                pricing_model = pricing["pricing_model"]
+
+                # Check if pricing model is supported by GAM adapter at all
+                try:
+                    gam_cost_type = PricingCompatibility.get_gam_cost_type(pricing_model)
+                except ValueError as e:
+                    error_msg = (
+                        f"Google Ad Manager adapter does not support '{pricing_model}' pricing. "
+                        f"Supported pricing models: CPM, VCPM, CPC, FLAT_RATE. "
+                        f"The requested pricing model ('{pricing_model}') is not available in GAM. "
+                        f"Please choose a product with compatible pricing."
+                    )
+                    self.log(f"[red]Error: {error_msg}[/red]")
+                    raise AdCPCapabilityNotSupportedError(error_msg)
+
+                self.log(
+                    f"📊 Package {pkg_id} pricing: {pricing_model} → GAM {gam_cost_type} "
+                    f"({pricing['currency']}, {'fixed' if pricing['is_fixed'] else 'auction'})"
+                )
+
+        # Validate that advertiser_id and trafficker_id are configured
+        if not self.advertiser_id or not self.trafficker_id:
+            error_msg = "GAM adapter is not fully configured for order creation. Missing required configuration: "
+            missing = []
+            if not self.advertiser_id:
+                missing.append("advertiser_id (company_id)")
+            if not self.trafficker_id:
+                missing.append("trafficker_id")
+            error_msg += ", ".join(missing)
+
+            self.log(f"[red]Error: {error_msg}[/red]")
+            raise AdCPConfigurationError(error_msg, field=", ".join(missing))
+
+        # Get products to access implementation_config
+
+        from src.core.database.database_session import get_db_session
+        from src.core.database.models import GAMInventory, Product, ProductInventoryMapping
+
+        products_map = {}
+        with get_db_session() as db_session:
+            for package in packages:
+                from sqlalchemy import select
+
+                # Extract product_id from package (not package_id!)
+                # package.package_id is like "pkg_prod_610fbb8b_08dec6ae_1"
+                # package.product_id is like "prod_610fbb8b"
+                product_id = package.product_id
+                logger.info(f"Looking up product for package {package.package_id}: product_id={product_id}")
+
+                stmt = select(Product).filter_by(
+                    tenant_id=self.tenant_id,
+                    product_id=product_id,
+                )
+                product = db_session.scalars(stmt).first()
+                if product:
+                    logger.info(f"Found product: {product.product_id} (name={product.name})")
+                    # Start with product's implementation_config
+                    impl_config = product.implementation_config.copy() if product.implementation_config else {}
+                    logger.info(f"Product implementation_config: {impl_config}")
+
+                    # Load inventory mappings from ProductInventoryMapping table
+                    inventory_stmt = select(ProductInventoryMapping).filter_by(
+                        product_id=product.product_id,
+                        tenant_id=self.tenant_id,  # Use product_id string, not integer id
+                    )
+                    inventory_mappings = db_session.scalars(inventory_stmt).all()
+                    logger.info(f"Found {len(inventory_mappings)} inventory mappings for product {product.product_id}")
+
+                    if inventory_mappings:
+                        # Get GAM ad unit IDs from the mappings
+                        ad_unit_ids = []
+                        placement_ids = []
+                        for mapping in inventory_mappings:
+                            logger.info(
+                                f"Processing mapping: type={mapping.inventory_type}, inventory_id={mapping.inventory_id}"
+                            )
+                            if mapping.inventory_type == "ad_unit":
+                                # Load the actual GAM inventory record
+                                gam_inv_stmt = select(GAMInventory).filter_by(
+                                    inventory_id=mapping.inventory_id,  # Match by inventory_id string
+                                    inventory_type="ad_unit",
+                                    tenant_id=self.tenant_id,
+                                )
+                                gam_inv = db_session.scalars(gam_inv_stmt).first()
+                                if gam_inv:
+                                    logger.info(f"Found GAM ad unit: {gam_inv.inventory_id}")
+                                    ad_unit_ids.append(str(gam_inv.inventory_id))
+                                else:
+                                    logger.warning(f"GAM ad unit not found for inventory_id={mapping.inventory_id}")
+                            elif mapping.inventory_type == "placement":
+                                # Load the actual GAM placement record
+                                gam_inv_stmt = select(GAMInventory).filter_by(
+                                    inventory_id=mapping.inventory_id,
+                                    inventory_type="placement",
+                                    tenant_id=self.tenant_id,
+                                )
+                                gam_inv = db_session.scalars(gam_inv_stmt).first()
+                                if gam_inv:
+                                    logger.info(f"Found GAM placement: {gam_inv.inventory_id}")
+                                    placement_ids.append(str(gam_inv.inventory_id))
+                                else:
+                                    logger.warning(f"GAM placement not found for inventory_id={mapping.inventory_id}")
+
+                        # Merge inventory mappings into implementation_config
+                        if ad_unit_ids:
+                            impl_config["targeted_ad_unit_ids"] = ad_unit_ids
+                            logger.info(f"Set targeted_ad_unit_ids: {ad_unit_ids}")
+                        if placement_ids:
+                            impl_config["targeted_placement_ids"] = placement_ids
+                            logger.info(f"Set targeted_placement_ids: {placement_ids}")
+
+                    logger.info(f"Final impl_config for {package.package_id}: {impl_config}")
+                    products_map[package.package_id] = {
+                        "product_id": product.product_id,
+                        "implementation_config": impl_config,
+                        "delivery_type": product.delivery_type,
+                    }
+                else:
+                    logger.error(f"Product NOT FOUND for package_id: {package.package_id}")
+
+        # Validate products have required inventory targeting BEFORE creating order
+        # This prevents the "hidden failure" where order is created but line items fail
+        for package in packages:
+            product_config = products_map.get(package.package_id)
+            if not product_config:
+                error_msg = (
+                    f"Product configuration missing for package '{package.package_id}'. "
+                    f"Product must exist in database with valid configuration before media buy creation."
+                )
+                self.log(f"[red]Error: {error_msg}[/red]")
+                raise AdCPProductUnavailableError(error_msg)
+
+            # Cast to dict to satisfy mypy (products_map values are dict[str, Any])
+            product_impl_config = cast(dict[str, Any], product_config.get("implementation_config", {}))
+            has_ad_units = product_impl_config.get("targeted_ad_unit_ids")
+            has_placements = product_impl_config.get("targeted_placement_ids")
+
+            if not has_ad_units and not has_placements:
+                pkg_product_id = product_config.get("product_id", package.package_id)
+                error_msg = (
+                    f"Product '{pkg_product_id}' (package '{package.package_id}') is not configured with inventory targeting. "
+                    f"GAM requires all products to have either ad units or placements configured. "
+                    f"\n\n⚠️  SETUP REQUIRED: Please configure this product's inventory before accepting media buy requests."
+                    f"\n\nTo fix:"
+                    f"\n  1. Go to Admin UI → Products → '{pkg_product_id}'"
+                    f"\n  2. Click 'Sync Inventory' to load ad units from GAM"
+                    f"\n  3. Assign ad units or placements to this product"
+                    f"\n  4. Save changes"
+                    f"\n\nAlternatively, for testing you can use Mock adapter instead of GAM (set ad_server='mock' on tenant)."
+                )
+                self.log(f"[red]Error: {error_msg}[/red]")
+                raise AdCPProductUnavailableError(error_msg)
+
+        # Validate targeting from MediaPackage objects (targeting_overlay is populated from request)
+        unsupported_features = []
+        for package in packages:
+            if package.targeting_overlay:
+                features = self._validate_targeting(package.targeting_overlay)
+                if features:
+                    unsupported_features.extend(features)
+
+        if unsupported_features:
+            error_msg = f"Unsupported targeting features: {', '.join(unsupported_features)}"
+            self.log(f"[red]Error: {error_msg}[/red]")
+            raise AdCPCapabilityNotSupportedError(error_msg)
+
+        # Check if manual approval is required for media buy creation
+        # Skip approval workflow if this media buy was already manually approved
+        # (when called from execute_approved_media_buy, we're in "post-approval execution" mode)
+        already_approved = getattr(request, "_already_approved", False)
+        if self._requires_manual_approval("create_media_buy") and not already_approved:
+            self.log("[yellow]Manual approval mode - creating workflow step for human intervention[/yellow]")
+
+            # Generate a media buy ID for tracking
+            media_buy_id = f"gam_order_{uuid.uuid4().hex[:8]}"
+
+            # Create manual order workflow step
+            step_id = self.workflow_manager.create_manual_order_workflow_step(
+                request,
+                packages,
+                start_time,
+                end_time,
+                media_buy_id,
+                order_name_template=self._order_name_template,
+            )
+
+            if step_id:
+                return self._build_create_success(
+                    request,
+                    media_buy_id,
+                    packages,
+                    creative_deadline_days=None,
+                    workflow_step_id=step_id,
+                )
+            else:
+                error_msg = "Failed to create manual order workflow step"
+                raise AdCPWorkflowError(error_msg)
+
+        # Automatic mode - create order directly
+        # Use pre-loaded naming template, or fallback to default
+        from src.adapters.gam.utils.constants import GAM_NAME_LIMITS
+        from src.adapters.gam.utils.naming import truncate_name_with_suffix
+        from src.core.utils.naming import apply_naming_template, build_order_name_context
+
+        order_name_template = self._order_name_template or "{campaign_name|brand_name} - {media_buy_id} - {date_range}"
+        tenant_gemini_key = None
+
+        # Get currency from the request's package pricing (validated upstream in media_buy_create.py)
+        # All packages in a media buy use the same currency
+        order_currency = "USD"  # Default fallback
+        if package_pricing_info:
+            for pricing in package_pricing_info.values():
+                order_currency = pricing.get("currency", "USD")
+                break  # All packages have same currency
+
+        # Get tenant's Gemini key for auto_name generation
+        try:
+            from src.core.database.database_session import get_db_session
+            from src.core.database.models import Tenant
+
+            with get_db_session() as db_session:
+                from sqlalchemy import select
+
+                tenant_stmt = select(Tenant).filter_by(tenant_id=self.tenant_id)
+                tenant_obj = db_session.scalars(tenant_stmt).first()
+                if tenant_obj:
+                    tenant_gemini_key = tenant_obj.gemini_api_key
+        except sqlalchemy.exc.SQLAlchemyError as e:
+            logger.warning(f"Could not load tenant Gemini key: {e}")
+
+        # Generate a pre-order media_buy_id for naming (GAM order_id replaces this in the response)
+        pre_order_id = f"gam_{uuid.uuid4().hex[:8]}"
+        context = build_order_name_context(
+            request, packages, start_time, end_time, tenant_gemini_key=tenant_gemini_key, media_buy_id=pre_order_id
+        )
+        base_order_name = apply_naming_template(order_name_template, context)
+
+        # Add unique identifier to prevent duplicate order names
+        unique_suffix = f"mb_{pre_order_id}"
+        full_order_name = f"{base_order_name} [{unique_suffix}]"
+
+        # Truncate to GAM's 255-character limit while preserving the unique suffix
+        order_name = truncate_name_with_suffix(full_order_name, GAM_NAME_LIMITS["max_order_name_length"])
+
+        # Calculate total budget from package budgets (AdCP v2.2.0)
+        total_budget_amount = request.get_total_budget()
+
+        order_id = self.orders_manager.create_order(
+            order_name=order_name,
+            total_budget=total_budget_amount,
+            start_time=start_time,
+            end_time=end_time,
+            currency=order_currency,
+        )
+
+        self.log(f"✓ Created GAM Order ID: {order_id}")
+
+        # Build targeting for each package (per AdCP spec, targeting is at package level)
+        package_targeting = {}
+        for package in packages:
+            if package.targeting_overlay:
+                package_targeting[package.package_id] = self._build_targeting(package.targeting_overlay)
+
+        # Build placement_targeting_map from all products' impl_configs (adcp#208)
+        # This maps placement_id → targeting_name for creative-level targeting
+        self._placement_targeting_map.clear()  # Reset for this order
+        for _pid, prod_info in products_map.items():
+            if not prod_info or not isinstance(prod_info, dict):
+                continue
+            prod_impl_config = cast(dict[str, Any], prod_info.get("implementation_config", {}) or {})
+            placement_targeting = cast(list[dict[str, Any]], prod_impl_config.get("placement_targeting", []))
+            for pt in placement_targeting:
+                placement_id = pt.get("placement_id")
+                targeting_name = pt.get("targeting_name")
+                if placement_id and targeting_name:
+                    # Warn if there's a collision from different products
+                    if placement_id in self._placement_targeting_map:
+                        existing = self._placement_targeting_map[placement_id]
+                        if existing != targeting_name:
+                            self.log(
+                                f"[yellow]Warning: placement_id '{placement_id}' has conflicting "
+                                f"targeting_names: '{existing}' vs '{targeting_name}'. Using '{targeting_name}'[/yellow]"
+                            )
+                    self._placement_targeting_map[placement_id] = targeting_name
+
+        if self._placement_targeting_map:
+            self.log(f"Built placement_targeting_map with {len(self._placement_targeting_map)} placements")
+
+        # Create line items for each package
+        try:
+            line_item_ids = self.orders_manager.create_line_items(
+                order_id=order_id,
+                packages=packages,
+                start_time=start_time,
+                end_time=end_time,
+                products_map=products_map,
+                log_func=self.log,
+                tenant_id=self.tenant_id,
+                order_name=order_name,
+                package_pricing_info=package_pricing_info,
+                package_targeting=package_targeting,
+                line_item_name_template=self._line_item_name_template,
+            )
+            self.log(f"✓ Created {len(line_item_ids)} line items")
+
+            # NOTE: platform_line_item_id persistence is handled by media_buy_create.py
+            # after response object is returned. See CreateMediaBuySuccess._platform_line_item_ids mapping.
+
+            # Approve the order now that it has line items
+            # GAM requires line items to exist before an order can be APPROVED
+            # Try once - if forecasting not ready, start background task
+            self.log(f"[cyan]Attempting to approve GAM Order {order_id} (max_retries=1)[/cyan]")
+            try:
+                approval_success = self.orders_manager.approve_order(order_id, max_retries=1)
+                if approval_success:
+                    self.log(f"✓ Approved GAM Order {order_id}")
+                else:
+                    # Approval failed (likely NO_FORECAST_YET) - start background polling
+                    self.log(
+                        f"[yellow]Order {order_id} forecasting not ready - starting background approval task[/yellow]"
+                    )
+
+                    # Get webhook URL from push notification config
+                    # Note: push_notification_config is not part of AdCP library's CreateMediaBuyRequest
+                    # Use getattr for backward compatibility with internal extensions
+                    webhook_url = None
+                    push_config = getattr(request, "push_notification_config", None)
+                    if push_config:
+                        webhook_url = (
+                            push_config.get("url")
+                            if isinstance(push_config, dict)
+                            else getattr(push_config, "url", None)
+                        )
+
+                    # Get principal_id from adapter's principal object
+                    principal_id = self.principal.principal_id if hasattr(self.principal, "principal_id") else "unknown"
+
+                    # Start background approval polling task
+                    from src.services.order_approval_service import start_order_approval_background
+
+                    try:
+                        approval_id = start_order_approval_background(
+                            order_id=order_id,
+                            media_buy_id=order_id,  # In automatic mode, media_buy_id = order_id
+                            tenant_id=self.tenant_id,
+                            principal_id=principal_id,
+                            webhook_url=webhook_url,
+                            max_attempts=12,  # 2 minutes with 10 second intervals
+                            poll_interval_seconds=10,
+                        )
+                        self.log(f"✓ Started background approval polling (job: {approval_id})")
+                    except ValueError as e:
+                        self.log(f"[red]Failed to start background approval: {e}[/red]")
+            except Exception as approval_error:
+                # Non-fatal error - order and line items were created successfully
+                self.log(f"[yellow]Warning: Could not approve order {order_id}: {approval_error}[/yellow]")
+
+        except AdCPError:
+            raise
+        except Exception as e:
+            error_msg = f"Order created but failed to create line items: {str(e)}"
+            self.log(f"[red]Error: {error_msg}[/red]")
+
+            # CRITICAL: Return media_buy_id=None to indicate failure
+            # Even though order was created, line items failed, so media buy is not functional
+            # Per AdCP spec: errors present → media_buy_id must be None
+            raise AdCPLineItemError(error_msg)
+
+        # Check if activation approval is needed (guaranteed line items require human approval)
+        has_guaranteed, item_types = self._check_order_has_guaranteed_items(order_id)
+        if has_guaranteed:
+            self.log("[yellow]Order contains guaranteed line items - creating activation workflow step[/yellow]")
+
+            step_id = self.workflow_manager.create_activation_workflow_step(order_id, packages)
+
+            # Create response and attach platform_line_item_id mapping for database persistence
+            # This mapping is used by media_buy_create.py to update MediaPackage records
+            response = self._build_create_success(
+                request,
+                order_id,
+                packages,
+                creative_deadline_days=None,
+                workflow_step_id=step_id,
+            )
+
+            # Store platform_line_item_id mapping as a non-standard attribute
+            # This survives Pydantic validation since it's set after construction
+            # Build mapping from parallel arrays: packages (with package_id) and line_item_ids
+            platform_line_item_ids = {}
+            for package, line_item_id in zip(packages, line_item_ids, strict=False):
+                platform_line_item_ids[package.package_id] = line_item_id
+
+            self.log(f"[DEBUG] Guaranteed path: Created platform_line_item_ids mapping: {platform_line_item_ids}")
+
+            # Attach to response object (bypass Pydantic validation)
+            object.__setattr__(response, "_platform_line_item_ids", platform_line_item_ids)
+            self.log("[DEBUG] Attached _platform_line_item_ids to response object")
+            self.log(f"[DEBUG] Verify attribute exists: {hasattr(response, '_platform_line_item_ids')}")
+
+            return response
+
+        # Create response and store platform_line_item_id mapping for database persistence
+        # This mapping is used by media_buy_create.py to update MediaPackage records
+        response = self._build_create_success(
+            request,
+            order_id,
+            packages,
+            creative_deadline_days=None,
+        )
+
+        # Store platform_line_item_id mapping as a non-standard attribute
+        # This survives Pydantic validation since it's set after construction
+        # Build mapping from parallel arrays: packages (with package_id) and line_item_ids
+        platform_line_item_ids = {}
+        for package, line_item_id in zip(packages, line_item_ids, strict=False):
+            platform_line_item_ids[package.package_id] = line_item_id
+
+        self.log(f"[DEBUG] Created platform_line_item_ids mapping: {platform_line_item_ids}")
+
+        # Attach to response object (bypass Pydantic validation)
+        object.__setattr__(response, "_platform_line_item_ids", platform_line_item_ids)
+        self.log("[DEBUG] Attached _platform_line_item_ids to response object")
+        self.log(f"[DEBUG] Verify attribute exists: {hasattr(response, '_platform_line_item_ids')}")
+
+        return response
+
+    def archive_order(self, order_id: str) -> bool:
+        """Archive a GAM order for cleanup purposes (delegated to orders manager)."""
+        if not self.advertiser_id or not self.trafficker_id:
+            self.log(
+                "[red]Error: GAM adapter not configured for order operations (missing advertiser_id or trafficker_id)[/red]"
+            )
+            return False
+        return self.orders_manager.archive_order(order_id)
+
+    def get_advertisers(
+        self, search_query: str | None = None, limit: int = 500, fetch_all: bool = False
+    ) -> list[dict[str, Any]]:
+        """Get list of advertisers from GAM (delegated to orders manager).
+
+        Args:
+            search_query: Optional search string to filter by name (uses LIKE '%query%')
+            limit: Maximum number of results per page (default: 500, max: 500)
+            fetch_all: If True, fetches ALL advertisers with pagination (can be slow for large networks)
+
+        Returns:
+            List of advertisers with id, name, and type
+        """
+        return self.orders_manager.get_advertisers(search_query=search_query, limit=limit, fetch_all=fetch_all)
+
+    def add_creative_assets(
+        self, media_buy_id: str, assets: list[dict[str, Any]], today: datetime
+    ) -> list[AssetStatus]:
+        """Create and associate creatives with line items (delegated to creatives manager)."""
+
+        # Validate that creatives manager is initialized
+        if not self.creatives_manager:
+            error_msg = "GAM adapter is not fully configured for creative operations. Missing required configuration: "
+            missing = []
+            if not self.advertiser_id:
+                missing.append("advertiser_id (company_id)")
+            if not self.trafficker_id:
+                missing.append("trafficker_id")
+            error_msg += ", ".join(missing)
+
+            self.log(f"[red]Error: {error_msg}[/red]")
+            return [
+                AssetStatus(
+                    asset_id=asset.get("asset_id", f"failed_{i}"),
+                    status="failed",
+                    message=error_msg,
+                    creative_id=None,
+                )
+                for i, asset in enumerate(assets)
+            ]
+
+        # Check if manual approval is required for creative assets
+        if self._requires_manual_approval("add_creative_assets"):
+            self.log("[yellow]Manual approval mode - creating workflow step for creative asset approval[/yellow]")
+
+            # Create approval workflow step
+            step_id = self.workflow_manager.create_approval_workflow_step(media_buy_id, "creative_assets_approval")
+
+            if step_id:
+                # Return asset statuses indicating they are awaiting approval
+                asset_statuses: list[AssetStatus] = []
+                for asset in assets:
+                    asset_statuses.append(
+                        AssetStatus(
+                            asset_id=asset.get("asset_id", f"pending_{len(asset_statuses)}"),
+                            status="submitted",
+                            message=f"Creative asset submitted for approval. Workflow step: {step_id}",
+                            creative_id=None,
+                            workflow_step_id=step_id,
+                        )
+                    )
+                return asset_statuses
+            else:
+                # Return failed statuses if workflow creation failed
+                asset_statuses = []
+                for asset in assets:
+                    asset_statuses.append(
+                        AssetStatus(
+                            asset_id=asset.get("asset_id", f"failed_{len(asset_statuses)}"),
+                            status="failed",
+                            message="Failed to create approval workflow step",
+                            creative_id=None,
+                        )
+                    )
+                return asset_statuses
+
+        # Automatic mode - process creatives directly
+        # Pass placement_targeting_map for creative-level targeting (adcp#208)
+        placement_targeting_map = getattr(self, "_placement_targeting_map", None)
+        return self.creatives_manager.add_creative_assets(
+            media_buy_id, assets, today, placement_targeting_map=placement_targeting_map
+        )
+
+    def associate_creatives(self, line_item_ids: list[str], platform_creative_ids: list[str]) -> list[dict[str, Any]]:
+        """Associate already-uploaded creatives with line items.
+
+        Used when buyer provides creative_ids in create_media_buy, indicating
+        creatives were already synced and should be associated immediately.
+
+        Args:
+            line_item_ids: GAM line item IDs
+            platform_creative_ids: GAM creative IDs (already uploaded)
+
+        Returns:
+            List of association results with status
+        """
+        if not self.creatives_manager:
+            self.log("[red]Error: Creatives manager not initialized[/red]")
+            return [
+                {
+                    "line_item_id": lid,
+                    "creative_id": cid,
+                    "status": "failed",
+                    "error": "Creatives manager not initialized",
+                }
+                for lid in line_item_ids
+                for cid in platform_creative_ids
+            ]
+
+        results = []
+
+        if not self.dry_run and self.client_manager:
+            lica_service = self.client_manager.get_service("LineItemCreativeAssociationService")
+
+        for line_item_id in line_item_ids:
+            for creative_id in platform_creative_ids:
+                if self.dry_run:
+                    self.log(
+                        f"[cyan][DRY RUN] Would associate creative {creative_id} with line item {line_item_id}[/cyan]"
+                    )
+                    results.append(
+                        {"line_item_id": line_item_id, "creative_id": creative_id, "status": "success (dry-run)"}
+                    )
+                else:
+                    association = {
+                        "creativeId": int(creative_id),
+                        "lineItemId": int(line_item_id),
+                    }
+
+                    try:
+                        lica_service.createLineItemCreativeAssociations([association])
+                        self.log(f"[green]✓ Associated creative {creative_id} with line item {line_item_id}[/green]")
+                        results.append({"line_item_id": line_item_id, "creative_id": creative_id, "status": "success"})
+                    except Exception as e:
+                        error_msg = str(e)
+                        self.log(
+                            f"[red]✗ Failed to associate creative {creative_id} with line item {line_item_id}: {error_msg}[/red]"
+                        )
+                        results.append(
+                            {
+                                "line_item_id": line_item_id,
+                                "creative_id": creative_id,
+                                "status": "failed",
+                                "error": error_msg,
+                            }
+                        )
+
+        return results
+
+    def check_media_buy_status(self, media_buy_id: str, today: datetime) -> CheckMediaBuyStatusResponse:
+        """Check the status of a media buy in GAM."""
+        # This would be implemented with appropriate manager delegation
+        # For now, returning a basic implementation
+        status = self.orders_manager.get_order_status(media_buy_id)
+
+        return CheckMediaBuyStatusResponse(
+            media_buy_id=media_buy_id,
+            status=status.lower(),  # Would need to be retrieved from database
+        )
+
+    def get_media_buy_delivery(
+        self, media_buy_id: str, date_range: ReportingPeriod, today: datetime
+    ) -> AdapterGetMediaBuyDeliveryResponse:
+        """Get delivery metrics for a media buy from GAM using ReportService.
+
+        Args:
+            media_buy_id: The media buy ID (used to look up GAM order/line items)
+            date_range: Reporting period with start/end dates
+            today: Current date for time-based calculations
+
+        Returns:
+            AdapterGetMediaBuyDeliveryResponse with real metrics from GAM
+        """
+        from sqlalchemy import select
+
+        from src.adapters.gam_reporting_service import GAMReportingService
+        from src.core.database.database_session import get_db_session
+        from src.core.database.models import MediaBuy
+        from src.core.schemas import AdapterPackageDelivery, DeliveryTotals
+
+        # Input validation
+        if not media_buy_id or not isinstance(media_buy_id, str):
+            logger.error(f"Invalid media_buy_id: {media_buy_id}")
+            return AdapterGetMediaBuyDeliveryResponse(
+                media_buy_id=str(media_buy_id) if media_buy_id else "invalid",
+                reporting_period=date_range,
+                by_package=[],
+                totals=DeliveryTotals(
+                    impressions=0, spend=0, clicks=None, ctr=None, completed_views=None, completion_rate=None
+                ),
+                currency="USD",
+            )
+
+        # Sanitize input (basic security check)
+        if len(media_buy_id) > 255 or not media_buy_id.isprintable():
+            logger.error(f"Suspicious media_buy_id format: {media_buy_id}")
+            return AdapterGetMediaBuyDeliveryResponse(
+                media_buy_id=media_buy_id[:50],  # Truncate for safety
+                reporting_period=date_range,
+                by_package=[],
+                totals=DeliveryTotals(
+                    impressions=0, spend=0, clicks=None, ctr=None, completed_views=None, completion_rate=None
+                ),
+                currency="USD",
+            )
+
+        # Get media buy from database to find GAM order/line item IDs
+        with get_db_session() as session:
+            stmt = select(MediaBuy).where(
+                MediaBuy.media_buy_id == media_buy_id,
+                MediaBuy.tenant_id == self.tenant_id,
+            )
+            media_buy = session.scalars(stmt).first()
+
+            if not media_buy:
+                logger.error(f"Media buy {media_buy_id} not found in database")
+                return AdapterGetMediaBuyDeliveryResponse(
+                    media_buy_id=media_buy_id,
+                    reporting_period=date_range,
+                    by_package=[],
+                    totals=DeliveryTotals(
+                        impressions=0,
+                        spend=0,
+                        clicks=0,
+                        ctr=0.0,
+                        completed_views=None,
+                        completion_rate=None,
+                    ),
+                    currency="USD",
+                )
+
+            # Extract package information from raw_request
+            raw_request = media_buy.raw_request or {}
+            packages_data = raw_request.get("packages", [])
+
+        # Initialize GAM reporting service
+        if self.dry_run or not self.client:
+            # Dry run mode - return simulated metrics
+            logger.info(f"Dry-run mode: returning simulated metrics for media buy {media_buy_id}")
+            total_budget = float(media_buy.budget) if media_buy.budget else 0.0
+            progress = 0.5  # Simulate 50% delivery
+
+            return AdapterGetMediaBuyDeliveryResponse(
+                media_buy_id=media_buy_id,
+                reporting_period=date_range,
+                by_package=[],
+                totals=DeliveryTotals(
+                    impressions=int(total_budget * 1000 * progress),  # Assume $1 CPM
+                    spend=total_budget * progress,
+                    clicks=int(total_budget * 1000 * progress * 0.01),  # 1% CTR
+                    ctr=1.0,
+                    completed_views=None,
+                    completion_rate=None,
+                ),
+                currency=str(media_buy.currency or "USD"),
+            )
+
+        reporting_service = GAMReportingService(self.client)
+
+        # date_range.start/.end are AwareDatetime objects
+        start_dt = date_range.start
+        end_dt = date_range.end
+
+        # Determine date range type for reporting
+        days_diff = (end_dt - start_dt).days
+        if days_diff <= 1:
+            range_type: str = "today"
+        elif days_diff <= 31:
+            range_type = "this_month"
+        else:
+            range_type = "lifetime"
+
+        # Fetch delivery data from GAM
+        # Note: We'll aggregate across all line items associated with this media buy
+        reporting_data = reporting_service.get_reporting_data(
+            date_range=cast("Literal['lifetime', 'this_month', 'today']", range_type),
+            advertiser_id=self.advertiser_id,
+            requested_timezone="America/New_York",
+        )
+
+        # Validate data freshness
+        # The adapter decides whether to return data or raise error if data is stale
+        # Target date is the end of the reporting period
+        target_date = date_range.end
+
+        is_fresh = validate_and_log_freshness(reporting_data, media_buy_id, target_date=target_date)
+
+        if not is_fresh:
+            raise AdCPAdapterError(f"GAM data is not fresh enough for media buy {media_buy_id}")
+
+        # Aggregate totals across all packages
+        total_impressions = reporting_data.metrics.get("total_impressions", 0)
+        total_clicks = reporting_data.metrics.get("total_clicks", 0)
+        total_spend = reporting_data.metrics.get("total_spend", 0.0)
+        avg_ctr = reporting_data.metrics.get("average_ctr", 0.0)
+
+        # Build daily breakdown from reporting data
+        daily_breakdown = []
+        daily_metrics = {}
+        for row in reporting_data.data:
+            # Extract date from the row (reporting service uses DATE dimension)
+            date_str = row.get("date", row.get("DATE", ""))
+            if date_str:
+                # Normalize to YYYY-MM-DD using dateutil (handles any format)
+                if not isinstance(date_str, str):
+                    date_str = str(date_str)
+                try:
+                    from dateutil import parser as dateutil_parser
+
+                    date_str = dateutil_parser.parse(date_str).strftime("%Y-%m-%d")
+                except (ValueError, OverflowError) as e:
+                    logger.warning("Unparseable date '%s' in reporting row, skipping: %s", date_str, e)
+                    continue
+
+                if date_str not in daily_metrics:
+                    daily_metrics[date_str] = {
+                        "impressions": 0.0,
+                        "spend": 0.0,
+                    }
+                daily_metrics[date_str]["impressions"] += float(row.get("impressions", 0))
+                daily_metrics[date_str]["spend"] += float(row.get("spend", 0.0))
+
+        # Convert daily metrics dict to sorted list of DailyBreakdown objects
+        for date_str in sorted(daily_metrics.keys()):
+            metrics = daily_metrics[date_str]
+            daily_breakdown.append(
+                {
+                    "date": date_str,
+                    "impressions": metrics["impressions"],
+                    "spend": metrics["spend"],
+                }
+            )
+
+        # Build package-level delivery data if we have line item IDs
+        by_package = []
+        if packages_data:
+            # Group reporting data by line item
+            line_item_metrics = {}
+            for row in reporting_data.data:
+                line_item_id = row.get("line_item_id", "")
+                if line_item_id:
+                    if line_item_id not in line_item_metrics:
+                        line_item_metrics[line_item_id] = {
+                            "impressions": 0,
+                            "clicks": 0,
+                            "spend": 0.0,
+                        }
+                    line_item_metrics[line_item_id]["impressions"] += row.get("impressions", 0)
+                    line_item_metrics[line_item_id]["clicks"] += row.get("clicks", 0)
+                    line_item_metrics[line_item_id]["spend"] += row.get("spend", 0.0)
+
+            # Match packages to line items and build delivery data
+            for i, pkg_data in enumerate(packages_data):
+                package_id = pkg_data.get("package_id", f"pkg_{i}")
+                # Try to find platform_line_item_id from the package data
+                platform_line_item_id = pkg_data.get("platform_line_item_id")
+
+                if platform_line_item_id and platform_line_item_id in line_item_metrics:
+                    metrics = line_item_metrics[platform_line_item_id]
+                    by_package.append(
+                        AdapterPackageDelivery(
+                            package_id=package_id,
+                            impressions=int(metrics["impressions"]),
+                            spend=metrics["spend"],
+                        )
+                    )
+
+        return AdapterGetMediaBuyDeliveryResponse(
+            media_buy_id=media_buy_id,
+            reporting_period=date_range,
+            by_package=by_package,
+            totals=DeliveryTotals(
+                impressions=total_impressions,
+                spend=total_spend,
+                clicks=total_clicks if total_clicks > 0 else None,
+                ctr=avg_ctr if avg_ctr > 0 else None,
+                completed_views=None,
+                completion_rate=None,
+            ),
+            currency=str(media_buy.currency or "USD"),
+            daily_breakdown=daily_breakdown if daily_breakdown else None,
+        )
+
+    def get_packages_snapshot(
+        self, package_refs: list[tuple[str, str, str | None]]
+    ) -> dict[str, dict[str, "Snapshot | None"]]:
+        """Return near-real-time delivery snapshots using cached GAM line item stats.
+
+        Uses stats stored in the GAMLineItem table (synced every ~15 minutes by the
+        background sync job). The staleness is derived from the last_synced timestamp.
+        """
+        from datetime import UTC, datetime
+
+        from sqlalchemy import select
+
+        from src.core.database.database_session import get_db_session
+        from src.core.database.models import GAMLineItem
+        from src.core.schemas import DeliveryStatus, Snapshot
+
+        result: dict[str, dict[str, Snapshot | None]] = {}
+        now = datetime.now(UTC)
+
+        # Collect all line item IDs we need to look up
+        line_item_ids = [ref[2] for ref in package_refs if ref[2] is not None]
+
+        if not line_item_ids:
+            for media_buy_id, package_id, _ in package_refs:
+                result.setdefault(media_buy_id, {})[package_id] = None
+            return result
+
+        with get_db_session() as session:
+            stmt = select(GAMLineItem).where(
+                GAMLineItem.tenant_id == self.tenant_id,
+                GAMLineItem.line_item_id.in_(line_item_ids),
+            )
+            line_items = {li.line_item_id: li for li in session.scalars(stmt).all()}
+
+            for media_buy_id, package_id, line_item_id in package_refs:
+                if line_item_id is None or line_item_id not in line_items:
+                    result.setdefault(media_buy_id, {})[package_id] = None
+                    continue
+
+                li = line_items[line_item_id]
+                impressions = float(li.stats_impressions or 0)
+                clicks = float(li.stats_clicks or 0) if li.stats_clicks else None
+
+                # Compute spend from impressions and cost_per_unit.
+                # TODO: add CPC (clicks * cost_per_unit) and flat-rate spend calculation.
+                if li.cost_per_unit and li.cost_type in ("CPM", "VCPM"):
+                    spend = impressions / 1000.0 * float(li.cost_per_unit)
+                else:
+                    spend = 0.0
+
+                # Staleness from last_synced timestamp
+                last_synced = li.last_synced
+                if last_synced.tzinfo is None:
+                    last_synced = last_synced.replace(tzinfo=UTC)
+                staleness_seconds = max(0, int((now - last_synced).total_seconds()))
+
+                # Delivery status from GAM line item status
+                gam_status = (li.status or "").upper()
+                if gam_status in ("DELIVERING", "READY"):
+                    if impressions == 0 and staleness_seconds > 900:
+                        delivery_status = DeliveryStatus.not_delivering
+                    else:
+                        delivery_status = DeliveryStatus.delivering
+                elif gam_status in ("COMPLETED",):
+                    delivery_status = DeliveryStatus.completed
+                elif gam_status in ("EXHAUSTED",):
+                    delivery_status = DeliveryStatus.budget_exhausted
+                else:
+                    delivery_status = None
+
+                snapshot = Snapshot(
+                    as_of=last_synced,
+                    impressions=impressions,
+                    spend=spend,
+                    clicks=clicks,
+                    delivery_status=delivery_status,
+                    staleness_seconds=staleness_seconds,
+                )
+                result.setdefault(media_buy_id, {})[package_id] = snapshot
+
+        return result
+
+    def update_media_buy(
+        self,
+        media_buy_id: str,
+        action: str,
+        package_id: str | None,
+        budget: int | None,
+        today: datetime,
+    ) -> UpdateMediaBuyResponse:
+        """Update a media buy in GAM."""
+        # Admin-only actions
+        admin_only_actions = ["approve_order"]
+
+        # Check if action requires admin privileges
+        if action in admin_only_actions and not self._is_admin_principal():
+            raise AdCPAuthorizationError("Only admin users can approve orders")
+
+        # Check if manual approval is required for media buy updates
+        if self._requires_manual_approval("update_media_buy"):
+            self.log("[yellow]Manual approval mode - creating workflow step for media buy update approval[/yellow]")
+
+            # Create approval workflow step for the update action
+            step_id = self.workflow_manager.create_approval_workflow_step(media_buy_id, f"update_media_buy_{action}")
+
+            if step_id:
+                # Manual approval success - no errors
+                return UpdateMediaBuySuccess(
+                    media_buy_id=media_buy_id,
+                    affected_packages=[],  # List of package_ids affected by update
+                    implementation_date=today,
+                )
+            else:
+                raise AdCPWorkflowError("Failed to create approval workflow step")
+
+        # Check for activate_order action with guaranteed items
+        if action == "activate_order":
+            # Check if order has guaranteed line items
+            has_guaranteed, item_types = self._check_order_has_guaranteed_items(media_buy_id)
+            if has_guaranteed:
+                self.log("[yellow]Order contains guaranteed line items - creating activation workflow step[/yellow]")
+
+                # Create activation workflow step
+                step_id = self.workflow_manager.create_activation_workflow_step(media_buy_id, [])
+
+                if step_id:
+                    # Activation workflow created - success (no errors)
+                    return UpdateMediaBuySuccess(
+                        media_buy_id=media_buy_id,
+                        affected_packages=[],
+                        implementation_date=today,
+                        workflow_step_id=step_id,
+                    )
+                else:
+                    raise AdCPActivationWorkflowError(
+                        f"Cannot auto-activate order with guaranteed line items: {', '.join(item_types)}"
+                    )
+
+        # Handle package budget updates
+        if action == "update_package_budget" and package_id and budget is not None:
+            from sqlalchemy.orm import attributes
+
+            from src.core.database.database_session import get_db_session
+            from src.core.database.repositories.media_buy import MediaBuyRepository
+
+            # Validate budget is positive (security: prevent negative/zero budgets)
+            if budget <= 0:
+                self.log(f"[red]Invalid budget value: {budget} (must be positive)[/red]")
+                raise AdCPValidationError(
+                    f"Budget must be positive, got {budget}",
+                    field="budget",
+                    details={"budget": budget},
+                )
+
+            self.log(f"[GAM] Updating package {package_id} budget to {budget} (with delivery validation)")
+
+            assert self.tenant_id is not None, "tenant_id required for DB operations"
+
+            with get_db_session() as session:
+                repo = MediaBuyRepository(session, self.tenant_id)
+                media_package = repo.get_package(media_buy_id, package_id)
+
+                if not media_package:
+                    self.log(f"[red]Package {package_id} not found for media buy {media_buy_id}[/red]")
+                    raise AdCPPackageNotFoundError(f"Package {package_id} not found for media buy {media_buy_id}")
+
+                # Validate budget isn't less than delivery to date
+                delivery_metrics = media_package.package_config.get("delivery_metrics", {})
+                current_spend = float(delivery_metrics.get("spend", 0))
+
+                if budget < current_spend:
+                    self.log(
+                        f"[red]Cannot set budget ${budget} below current spend ${current_spend} "
+                        f"for package {package_id}[/red]"
+                    )
+                    raise AdCPBudgetExceededError(
+                        f"Cannot set budget ${budget} below current spend ${current_spend}",
+                        details={
+                            "requested_budget": budget,
+                            "current_spend": current_spend,
+                            "package_id": package_id,
+                        },
+                    )
+
+                # Get platform line item ID from package config
+                platform_line_item_id = media_package.package_config.get("platform_line_item_id")
+                if not platform_line_item_id:
+                    self.log(f"[red]Package {package_id} has no platform_line_item_id - cannot sync to GAM[/red]")
+                    raise AdCPValidationError(
+                        f"Package {package_id} has no GAM line item ID",
+                        details={"package_id": package_id},
+                    )
+
+                # Get pricing model from package config for budget calculation
+                pricing_info = media_package.package_config.get("pricing", {})
+                pricing_model = pricing_info.get("model", "cpm").lower()
+                currency = pricing_info.get("currency", "USD")
+
+                # Sync budget change to GAM line item
+                self.log(f"[GAM] Syncing budget change to GAM line item {platform_line_item_id}")
+                success = self.orders_manager.update_line_item_budget(
+                    line_item_id=platform_line_item_id,
+                    new_budget=float(budget),
+                    pricing_model=pricing_model,
+                    currency=currency,
+                )
+
+                if not success:
+                    self.log(f"[red]Failed to update GAM line item {platform_line_item_id} budget[/red]")
+                    raise AdCPGamUpdateError(
+                        "Failed to update budget in Google Ad Manager",
+                        details={
+                            "package_id": package_id,
+                            "line_item_id": platform_line_item_id,
+                        },
+                    )
+
+                # Update budget in package_config JSON after successful GAM sync
+                media_package.package_config["budget"] = float(budget)
+                # Flag the JSON field as modified so SQLAlchemy persists it
+                attributes.flag_modified(media_package, "package_config")
+                session.commit()
+                self.log(f"✓ Updated package {package_id} budget to ${budget} in both GAM and database")
+
+            return UpdateMediaBuySuccess(
+                media_buy_id=media_buy_id,
+                affected_packages=[],  # Required by AdCP spec
+                implementation_date=today,
+            )
+
+        # Handle pause/resume actions
+        if action in ["pause_package", "resume_package", "pause_media_buy", "resume_media_buy"]:
+            from src.core.database.database_session import get_db_session
+            from src.core.database.repositories.media_buy import MediaBuyRepository
+
+            assert self.tenant_id is not None, "tenant_id required for DB operations"
+
+            # Determine if we're pausing or resuming
+            is_pause = action.startswith("pause_")
+            new_status = "PAUSED" if is_pause else "READY"
+            action_verb = "Pausing" if is_pause else "Resuming"
+
+            # Package-level actions
+            if action in ["pause_package", "resume_package"]:
+                if not package_id:
+                    raise AdCPValidationError(
+                        f"package_id required for {action}",
+                        field="package_id",
+                        details={"action": action},
+                    )
+
+                with get_db_session() as session:
+                    repo = MediaBuyRepository(session, self.tenant_id)
+                    media_package = repo.get_package(media_buy_id, package_id)
+
+                    if not media_package:
+                        raise AdCPPackageNotFoundError(
+                            f"Package {package_id} not found", details={"package_id": package_id}
+                        )
+
+                    # Get platform line item ID
+                    platform_line_item_id = media_package.package_config.get("platform_line_item_id")
+                    if not platform_line_item_id:
+                        raise AdCPValidationError(
+                            f"Package {package_id} has no GAM line item ID",
+                            details={"package_id": package_id},
+                        )
+
+                    # Update status in GAM
+                    self.log(f"[GAM] {action_verb} line item {platform_line_item_id}")
+                    if is_pause:
+                        success = self.orders_manager.pause_line_item(platform_line_item_id)
+                    else:
+                        success = self.orders_manager.resume_line_item(platform_line_item_id)
+
+                    if not success:
+                        raise AdCPGamUpdateError(
+                            f"Failed to {action_verb.lower()} line item in GAM",
+                            details={
+                                "package_id": package_id,
+                                "line_item_id": platform_line_item_id,
+                            },
+                        )
+
+                    self.log(f"✓ {action_verb} package {package_id} in GAM")
+
+                    # Return affected package with paused state
+                    affected_package = AffectedPackage(
+                        package_id=package_id,
+                        paused=is_pause,  # True if paused, False if resumed
+                        changes_applied=None,
+                        buyer_package_ref=None,
+                    )
+
+                    return UpdateMediaBuySuccess(
+                        media_buy_id=media_buy_id,
+                        affected_packages=[affected_package],
+                        implementation_date=today,
+                    )
+
+            # Media buy-level actions (pause/resume all packages)
+            elif action in ["pause_media_buy", "resume_media_buy"]:
+                with get_db_session() as session:
+                    repo = MediaBuyRepository(session, self.tenant_id)
+                    packages = repo.get_packages(media_buy_id)
+
+                    if not packages:
+                        raise AdCPPackageNotFoundError(
+                            f"No packages found for media buy {media_buy_id}",
+                            details={"media_buy_id": media_buy_id},
+                        )
+
+                    # Pause/resume each package's line item
+                    failed_items = []
+                    for pkg in packages:
+                        platform_line_item_id = pkg.package_config.get("platform_line_item_id")
+                        if not platform_line_item_id:
+                            failed_items.append({"id": pkg.package_id, "reason": "No GAM line item ID"})
+                            continue
+
+                        self.log(f"[GAM] {action_verb} line item {platform_line_item_id} (package {pkg.package_id})")
+                        if is_pause:
+                            success = self.orders_manager.pause_line_item(platform_line_item_id)
+                        else:
+                            success = self.orders_manager.resume_line_item(platform_line_item_id)
+
+                        if not success:
+                            failed_items.append(
+                                {"id": pkg.package_id, "reason": f"GAM line item {platform_line_item_id} update failed"}
+                            )
+
+                    if failed_items:
+                        raise AdCPBulkUpdateError(
+                            f"Failed to {action_verb.lower()} some packages in GAM",
+                            details={"failed_items": failed_items},
+                        )
+
+                    self.log(f"✓ {action_verb} all {len(packages)} packages in media buy {media_buy_id}")
+
+                    # Return all affected packages with paused state
+                    affected_packages_list = [
+                        AffectedPackage(
+                            package_id=pkg.package_id,
+                            paused=is_pause,  # True if paused, False if resumed
+                            changes_applied=None,
+                            buyer_package_ref=None,
+                        )
+                        for pkg in packages
+                    ]
+
+                    return UpdateMediaBuySuccess(
+                        media_buy_id=media_buy_id,
+                        affected_packages=affected_packages_list,
+                        implementation_date=today,
+                    )
+
+            # Should not reach here - both pause/resume branches return above
+            return UpdateMediaBuySuccess(
+                media_buy_id=media_buy_id,
+                affected_packages=[],
+                implementation_date=today,
+            )
+
+        # Explicit failure for unsupported actions (no silent success)
+        self.log(f"[red]Unsupported action '{action}' for GAM adapter[/red]")
+        raise AdCPCapabilityNotSupportedError(
+            f"Action '{action}' is not supported by the Google Ad Manager adapter",
+            details={
+                "action": action,
+                "supported_actions": ["approve_order", "activate_order", "update_package_budget"],
+            },
+        )
+
+    def update_media_buy_performance_index(self, media_buy_id: str, package_performance: list) -> bool:
+        """Update the performance index for packages in a media buy."""
+        # This would be implemented with appropriate manager delegation
+        self.log(f"Update performance index for media buy {media_buy_id} with {len(package_performance)} packages")
+        return True
+
+    def get_config_ui_endpoint(self) -> str | None:
+        """Return the endpoint for GAM-specific configuration UI."""
+        return "/adapters/gam/config"
+
+    def register_ui_routes(self, app: Flask) -> None:
+        """Register GAM-specific configuration routes."""
+        from flask import jsonify, render_template, request
+
+        @app.route("/adapters/gam/config/<tenant_id>/<product_id>", methods=["GET", "POST"])
+        def gam_config_ui(tenant_id: str, product_id: str):
+            """GAM adapter configuration UI."""
+            if request.method == "POST":
+                # Handle configuration updates
+                return jsonify({"success": True})
+
+            return render_template(
+                "gam_config.html", tenant_id=tenant_id, product_id=product_id, title="Google Ad Manager Configuration"
+            )
+
+    def validate_product_config(self, config: dict[str, Any]) -> tuple[bool, str | None]:
+        """Validate GAM-specific product configuration."""
+        required_fields = ["network_code", "advertiser_id"]
+
+        for field in required_fields:
+            if not config.get(field):
+                return False, f"Missing required field: {field}"
+
+        return True, None
+
+    def _create_order_statement(self, order_id: int):
+        """Helper method to create a GAM statement for order filtering."""
+        return self.orders_manager.create_order_statement(order_id)
+
+    # Inventory management methods - delegated to inventory manager
+    def discover_ad_units(self, parent_id=None, max_depth=10):
+        """Discover ad units in the GAM network (delegated to inventory manager)."""
+        return self.inventory_manager.discover_ad_units(parent_id, max_depth)
+
+    def discover_placements(self):
+        """Discover all placements in the GAM network (delegated to inventory manager)."""
+        return self.inventory_manager.discover_placements()
+
+    def discover_custom_targeting(self):
+        """Discover all custom targeting keys and values (delegated to inventory manager)."""
+        return self.inventory_manager.discover_custom_targeting()
+
+    def discover_audience_segments(self):
+        """Discover audience segments (delegated to inventory manager)."""
+        return self.inventory_manager.discover_audience_segments()
+
+    def sync_all_inventory(self):
+        """Perform full inventory sync (delegated to inventory manager)."""
+        return self.inventory_manager.sync_all_inventory()
+
+    def build_ad_unit_tree(self):
+        """Build hierarchical ad unit tree (delegated to inventory manager)."""
+        return self.inventory_manager.build_ad_unit_tree()
+
+    def get_targetable_ad_units(self, include_inactive=False, min_sizes=None):
+        """Get targetable ad units (delegated to inventory manager)."""
+        return self.inventory_manager.get_targetable_ad_units(include_inactive, min_sizes)
+
+    def suggest_ad_units_for_product(self, creative_sizes, keywords=None):
+        """Suggest ad units for product (delegated to inventory manager)."""
+        return self.inventory_manager.suggest_ad_units_for_product(creative_sizes, keywords)
+
+    def validate_inventory_access(self, ad_unit_ids):
+        """Validate inventory access (delegated to inventory manager)."""
+        return self.inventory_manager.validate_inventory_access(ad_unit_ids)
+
+    # Sync management methods - delegated to sync manager
+    def sync_inventory(self, db_session, force=False, custom_targeting_limit=1000):
+        """Synchronize inventory data from GAM (delegated to sync manager)."""
+        return self.sync_manager.sync_inventory(db_session, force, custom_targeting_limit)
+
+    def sync_orders(self, db_session, force=False):
+        """Synchronize orders data from GAM (delegated to sync manager)."""
+        return self.sync_manager.sync_orders(db_session, force)
+
+    def sync_full(self, db_session, force=False, custom_targeting_limit=1000):
+        """Perform full synchronization (delegated to sync manager)."""
+        return self.sync_manager.sync_full(db_session, force, custom_targeting_limit)
+
+    def sync_selective(self, db_session, sync_types, custom_targeting_limit=1000, audience_segment_limit=None):
+        """Perform selective synchronization (delegated to sync manager)."""
+        return self.sync_manager.sync_selective(db_session, sync_types, custom_targeting_limit, audience_segment_limit)
+
+    def get_sync_status(self, db_session, sync_id):
+        """Get sync status (delegated to sync manager)."""
+        return self.sync_manager.get_sync_status(db_session, sync_id)
+
+    def get_sync_history(self, db_session, limit=10, offset=0, status_filter=None):
+        """Get sync history (delegated to sync manager)."""
+        return self.sync_manager.get_sync_history(db_session, limit, offset, status_filter)
+
+    def needs_sync(self, db_session, sync_type, max_age_hours=24):
+        """Check if sync is needed (delegated to sync manager)."""
+        return self.sync_manager.needs_sync(db_session, sync_type, max_age_hours)
